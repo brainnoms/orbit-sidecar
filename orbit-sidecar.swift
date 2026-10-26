@@ -794,7 +794,11 @@ func cpAttach(_ conn: NWConnection, _ boot: String?) {
     cpElection()
     cpLock.lock(); let you = boot.map { !$0.isEmpty && mainBoot == $0 } ?? false; cpLock.unlock()
     npLock.lock(); let np = npCache; npLock.unlock()
-    cpSend(conn, "hello", "{\"epoch\":\(EPOCH),\"proto\":1,\"version\":\"\(SIDECAR_VERSION)\",\"elected\":\(you),\"sources\":\(sourcesArr()),\"nowplaying\":\(np)}")
+    // ⟦STATE-TRUTH⟧ hello is the COMPLETE resync snapshot: control state (mic/stt/tts)
+    // rides discovery itself — a restarted sidecar or reloaded renderer learns the
+    // truth at hello time, not up to 8s later via /b/status polling. Never let the UI
+    // paint defaults over real state.
+    cpSend(conn, "hello", "{\"epoch\":\(EPOCH),\"proto\":1,\"version\":\"\(SIDECAR_VERSION)\",\"elected\":\(you),\"state\":\(ChannelB.shared.statusJSON()),\"sources\":\(sourcesArr()),\"nowplaying\":\(np)}")
 }
 // Roster pruning: hello older than 30s with NO live conn is dropped; a dead conn
 // drops to nil so the same boot can re-attach. Then re-elect (standby takes over).
