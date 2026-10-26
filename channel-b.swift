@@ -283,9 +283,32 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // ---------------- HTTP surface (hooked from orbit-sidecar handle()) ----------------
     // returns true if consumed
     func handle(_ conn: NWConnection, _ method: String, _ path: String, _ req: String) -> Bool {
-        if path == "/b/stream" {
+        if path == "/b/stream" || path.hasPrefix("/b/stream?") {
+            // ⟦EPOCH-TRUTH⟧ the b-stream shares the visualizer identity: once an epoch>0
+            // claim exists, bootless legacy streams and superseded boots are 410'd fatally,
+            // so leaked pre-guard /b/stream sockets get torn down BY THE BROWSER instead of
+            // squatting Chromium's six-per-host pool (the "no now-playing after reload" law).
+            var role = ""; var boot = ""; var epoch: Double = 0
+            if let qi = path.firstIndex(of: "?") {
+                for kv in path[path.index(after: qi)...].split(separator: "&") {
+                    let p = kv.split(separator: "=", maxSplits: 1)
+                    if p.count == 2 {
+                        let v = String(p[1]).removingPercentEncoding ?? String(p[1])
+                        if p[0] == "role" { role = v }; if p[0] == "boot" { boot = v }
+                        if p[0] == "epoch" { epoch = Double(v) ?? 0 }
+                    }
+                }
+            }
+            if curClaim().1 > 0 {
+                if role != "doctor" {
+                    let cc = curClaim()
+                    if boot.isEmpty { goneResp(conn); return true }
+                    if epoch <= cc.1 && boot != cc.0 { goneResp(conn); return true }
+                }
+            }
             send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n")
             bblock.lock(); sseConns.append(conn); bblock.unlock()
+            streamRegLock.lock(); streamReg.append((conn, boot, epoch, role)); streamRegLock.unlock()
             publish("b-hello", statusJSON())
             return true
         }

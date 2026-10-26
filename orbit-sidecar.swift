@@ -67,11 +67,37 @@ var lastRender: CFTimeInterval = 0        // ioProc render stamp (lock-owned); 0
 // they spawn, before later top-level init has run (Swift top-level vars init in
 // source order — a late declaration here would be a boot-time race/crash).
 let EPOCH = Int(Date().timeIntervalSince1970)     // sidecar boot epoch (unix seconds)
-final class HelloRec { var conn: NWConnection?; var version = ""; var lastHello = Date.distantPast }
+final class HelloRec { var conn: NWConnection?; var version = ""; var lastHello = Date.distantPast; var epoch: Double = 0 }
 let cpLock = NSLock()
 var roster: [String: HelloRec] = [:]              // bootId -> presence (cpLock)
 var mainBoot: String? = nil                       // current elected main (cpLock)
 var protoConns: [NWConnection] = []               // every live proto SSE conn (cpLock)
+// ⟦EPOCH-TRUTH⟧ One visualizer is the truth: the boot claiming the highest module-load
+// epoch (ms). epoch==0 means legacy client. Once an epoch>0 claim exists, superseded
+// boots AND bootless legacy streams get 410 Gone — a FATAL EventSource error, so the
+// BROWSER itself tears down zombie sockets instead of squatting the 6-per-host pool.
+// This is the server enforcing "one main" instead of praying every realm GC's itself.
+func curClaim() -> (String?, Double) {
+    cpLock.lock(); defer { cpLock.unlock() }
+    var cb: String? = nil; var ce: Double = 0
+    for (b, r) in roster where r.epoch > ce { ce = r.epoch; cb = b }
+    return (cb, ce)
+}
+func goneResp(_ c: NWConnection) { httpResp(c, "410 Gone", "application/json", "{\"ok\":false,\"err\":\"replaced\"}") }
+// Every stream conn that carries a visualizer identity, so the 5s sweep can RETROACTIVELY
+// cancel already-attached zombies the moment a newer epoch claims the plane (410 alone only
+// guards the door; it cannot reach connections that came in before the claim).
+let streamRegLock = NSLock()
+var streamReg: [(c: NWConnection, boot: String, epoch: Double, role: String)] = []
+func streamEnforce() {
+    let (cb, ce) = curClaim()
+    guard ce > 0 else { return }
+    streamRegLock.lock()
+    let doomed = streamReg.filter { $0.role != "doctor" && ($0.boot.isEmpty || ($0.epoch <= ce && $0.boot != cb)) }
+    streamReg.removeAll { e in doomed.contains { $0.c === e.c } }
+    streamRegLock.unlock()
+    for d in doomed { d.c.cancel(); log("epoch-purge boot=\(d.boot.isEmpty ? "legacy" : d.boot)") }
+}
 func cpSend(_ c: NWConnection, _ event: String, _ data: String) { send(c, "event: \(event)\ndata: \(data)\n\n") }
 func cpBroadcast(_ event: String, _ data: String) {
     let msg = "event: \(event)\ndata: \(data)\n\n"
@@ -787,10 +813,18 @@ func cpElection() {
 }
 // A proto SSE conn attached: register (boot may arrive later via POST /hello),
 // run election, then answer the full-state snapshot IMMEDIATELY (reconnect==resync).
-func cpAttach(_ conn: NWConnection, _ boot: String?) {
+func cpAttach(_ conn: NWConnection, _ boot: String?, _ epoch: Double = 0, _ role: String = "") {
+    // ⟦EPOCH-TRUTH⟧ enforce BEFORE any headers: replaced boots are 410'd, fatally.
+    let (cb, ce) = curClaim()
+    if ce > 0 && role != "doctor" {
+        if let b = boot, !b.isEmpty { if epoch <= ce && b != cb { goneResp(conn); return } }
+        else { goneResp(conn); return }
+    }
     cpLock.lock(); protoConns.append(conn)
-    if let b = boot, !b.isEmpty { let r = roster[b] ?? HelloRec(); r.conn = conn; roster[b] = r }
+    if let b = boot, !b.isEmpty { let r = roster[b] ?? HelloRec(); r.conn = conn; if epoch > 0 { r.epoch = max(r.epoch, epoch) }; roster[b] = r }
     cpLock.unlock()
+    streamRegLock.lock(); streamReg.append((conn, boot ?? "", epoch, role)); streamRegLock.unlock()
+    streamEnforce()
     cpElection()
     cpLock.lock(); let you = boot.map { !$0.isEmpty && mainBoot == $0 } ?? false; cpLock.unlock()
     npLock.lock(); let np = npCache; npLock.unlock()
@@ -811,6 +845,8 @@ func cpPrune() {
     }
     protoConns = protoConns.filter { $0.state == .ready }
     cpLock.unlock()
+    streamRegLock.lock(); streamReg = streamReg.filter { $0.c.state == .ready }; streamRegLock.unlock()
+    streamEnforce()
     cpElection()
 }
 // ---- /ctl command channel: one versioned door for all verbs -----------------
@@ -892,7 +928,7 @@ func handle(_ conn: NWConnection, _ req: String) {
                 }
                 return nil
             }
-            if qp("proto") == "1" { cpAttach(conn, qp("boot")) }
+            if qp("proto") == "1" { cpAttach(conn, qp("boot"), Double(qp("epoch") ?? "") ?? 0, qp("role") ?? "") }
         }
         return
     }
@@ -929,10 +965,18 @@ func handle(_ conn: NWConnection, _ req: String) {
         }
         cpLock.lock(); let r = roster[boot] ?? HelloRec(); r.lastHello = Date()
         if let v = j["version"] as? String { r.version = v }
-        roster[boot] = r; cpLock.unlock()
+        // ⟦EPOCH-TRUTH⟧ claim/refresh with module-load epoch; a heartbeat from a boot that
+        // can no longer be main is answered {replaced:true} so new-code clients retire and
+        // stop re-arming. Legacy (epoch==0) boots never steal from an epoch>0 claim.
+        if let e = (j["epoch"] as? Double) ?? (j["epoch"] as? Int).map(Double.init) { r.epoch = max(r.epoch, e) }
+        roster[boot] = r
+        var cb: String? = nil; var ce: Double = 0
+        for (b2, rr) in roster where rr.epoch > ce { ce = rr.epoch; cb = b2 }
+        let replacedHere = ce > 0 && r.epoch < ce && cb != boot
+        cpLock.unlock()
         cpElection()
         cpLock.lock(); let isMain = mainBoot == boot; cpLock.unlock()
-        httpResp(conn, "200 OK", "application/json", "{\"ok\":true,\"main\":\(isMain),\"epoch\":\(EPOCH)}")
+        httpResp(conn, "200 OK", "application/json", replacedHere ? "{\"ok\":false,\"replaced\":true,\"main\":\"\(cb ?? "")\"}" : "{\"ok\":true,\"main\":\(isMain),\"epoch\":\(EPOCH)}")
         return
     }
     if method == "POST" && path == "/ctl" {
