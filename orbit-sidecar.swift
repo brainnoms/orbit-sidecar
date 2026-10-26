@@ -414,14 +414,14 @@ func runOA(_ src: String, _ timeout: Double) -> String? {
     if sem.wait(timeout: .now() + timeout) == .timedOut { p.interrupt(); p.terminate(); return nil }
     return res
 }
-func npJSON(_ app: String, _ st: String, _ rec: String) -> String {
+func npJSON(_ app: String, _ st: String, _ rec: String, pos: Double = 0) -> String {
     let f = rec.components(separatedBy: "\n")
     let trk = f.count > 0 ? f[0] : ""
     let key = trk.isEmpty ? "" : (app + "|" + trk)
     artLock.lock(); let ver = (artKey == key && !artBytes.isEmpty) ? artHash : ""; artLock.unlock()
     let d: [String: Any] = ["app": app, "state": st,
         "track": trk, "artist": f.count > 1 ? f[1] : "",
-        "album": f.count > 2 ? f[2] : "", "pos": 0, "art": key, "artv": ver]
+        "album": f.count > 2 ? f[2] : "", "pos": pos, "art": key, "artv": ver]
     guard let j = try? JSONSerialization.data(withJSONObject: d), let s = String(data: j, encoding: .utf8) else {
         return "{\"app\":\"\",\"track\":\"\",\"artist\":\"\",\"album\":\"\",\"state\":\"\",\"pos\":0}"
     }
@@ -547,6 +547,11 @@ func resolveHelperPaths() -> (pl: String, dylib: String)? {
 // CONCURRENTLY with the child running — reading only after exit deadlocks once
 // the 64KB pipe buffer fills (perl blocks on write, never exits). A 5s watchdog
 // kills a wedged reader so it can never hang the 2s poll loop.
+// ⟦MR-STALE / ART-STARVE⟧ poll-thread state (single serial poller — no lock needed).
+var mrLastPos: Double = -1
+var mrFrozen = 0
+var artStarveKey = ""
+var artStarveAt: CFTimeInterval = 0
 func readNowPlayingViaPerl() -> [String: Any]? {
     guard let paths = resolveHelperPaths() else { return nil }
     let p = Process()
@@ -652,7 +657,32 @@ func npBusJSON(_ np: NowPlaying) -> String {
 func readNowPlaying() -> String {
     // Provider chain (see seam above): OS Now Playing bus first; Apple Events
     // Music/Spotify below is the legacy fallback for anything that skips the bus.
-    if let np = providerMediaRemote() { let s = npBusJSON(np); if !s.isEmpty { return s } }
+    // ⟦MR-STALE / ART-STARVE⟧ The bus is fast but its cache is a liar: caught in the
+    // wild 2026-10-26, MediaRemote froze at pos 3.4 for 3+ minutes while Music sat at
+    // 327, and its artworkData served covers three tracks old — updating only on track
+    // CHANGE, dying in between. Trusting it unconditionally starved the healthy Apple
+    // Events fallback (fresh position, real artwork, catalog resolve). So: a playing
+    // source whose position never advances is stale, and a key whose art never commits
+    // for 8s has been served lies — both drop to the fallback instead of poisoning the
+    // panel. Correct state live; never pin the UI to one unreliable witness.
+    if let np = providerMediaRemote() {
+        if np.state == "playing" {
+            if np.pos > 0 && np.pos == mrLastPos { mrFrozen += 1 } else { mrFrozen = 0 }
+            mrLastPos = np.pos
+        } else { mrFrozen = 0; mrLastPos = -1 }
+        if mrFrozen < 4 {
+            let s = npBusJSON(np)
+            if !s.isEmpty {
+                if !s.contains("\"artv\":\"\"") { artStarveKey = ""; return s }
+                let k = np.app + "|" + np.track
+                if k != artStarveKey { artStarveKey = k; artStarveAt = CACurrentMediaTime() }
+                if CACurrentMediaTime() - artStarveAt < 8 { return s }
+                log("ART-STARVE \(k) 8s no art — falling back to Apple Events")
+            }
+        } else if mrFrozen == 4 {
+            log("MR-STALE pos frozen at \(np.pos) — falling back to Apple Events")
+        }
+    }
     let empty = "{\"app\":\"\",\"track\":\"\",\"artist\":\"\",\"album\":\"\",\"state\":\"\",\"pos\":0}"
     // Follow the SPEAKER, not a fixed order. The loud app wins; silent-but-
     // reported apps are fallback only.
@@ -695,7 +725,10 @@ func readNowPlaying() -> String {
                 log("catalog art ok \(app): \(t0)")
             }
         }
-        return npJSON(app, st, rec)
+        // ⟦MR-STALE⟧ fallback carries position too — the bar and the position-advance
+        // clock need it; one extra 0.8s query is nothing on this (cold) path.
+        let fpos = Double(runOA("tell application \"\(app)\" to return (player position as string)", 0.8) ?? "") ?? 0
+        return npJSON(app, st, rec, pos: fpos)
     }
     return empty
 }
