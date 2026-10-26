@@ -662,6 +662,36 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             Self.feedInject(body)
         }
     }
+    // ---- /ctl command surface (control-plane v1) ----
+    // Same verbs and state paths as the legacy /b/mode, /b/inject, /b/tts/speak
+    // handlers above, driven from one JSON dispatch instead of raw HTTP bodies.
+    // Legacy endpoints stay untouched (thin-alias transition window).
+    func ctlMode(_ args: [String: Any]) -> (Bool, String) {          // == POST /b/mode
+        if let dd = args["dump"] as? String { setState { dumpDir = dd }; log("provider dump → \(dd.isEmpty ? "off" : dd)") }
+        if let s = args["stt"] as? Bool {
+            engineMuted = !s
+            if s { armMic(); setState { sttState = "live" } }
+            else { disarmMic(); setState { sttState = "muted" } }
+        }
+        return (true, statusJSON())
+    }
+    func ctlMicMute(_ args: [String: Any]) -> (Bool, String) {       // mic-mute == /b/mode {"stt":!mute}
+        let mute = (args["mute"] as? Bool) ?? ((args["on"] as? Bool).map { !$0 }) ?? true
+        engineMuted = mute
+        if mute { disarmMic(); setState { sttState = "muted" } } else { armMic(); setState { sttState = "live" } }
+        return (true, statusJSON())
+    }
+    func ctlInject(_ args: [String: Any]) -> (Bool, String) {        // == POST /b/inject
+        guard let d = try? JSONSerialization.data(withJSONObject: args) else { return (true, "{\"injected\":false}") }
+        Self.feedInject(d)   // validates {seg,wav}, logs on bad payload — same contract as /b/inject
+        return (true, "{\"injected\":true}")
+    }
+    func ctlSpeak(_ args: [String: Any]) -> (Bool, String) {         // == POST /b/tts/speak
+        guard let t = args["text"] as? String, !t.isEmpty else { return (false, "bad-args") }
+        if args["barge"] as? Bool == true { barge() }
+        enqueue(t)
+        return (true, "{\"queued\":true}")
+    }
     func collect(_ conn: NWConnection, need: Int, into acc: inout Data, done: @escaping (Data) -> Void) {
         // need = TOTAL Content-Length bytes; accumulate until complete (single reader on conn)
         var work = acc

@@ -25,7 +25,7 @@ var aDev = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOu
 var outDev = AudioObjectID(0); var dsz = UInt32(4); AudioObjectGetPropertyData(hw, &aDev, 0, nil, &dsz, &outDev)
 var aUID = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: AudioObjectPropertyElement(0))
 var uref: Unmanaged<CFString>?; var usz = UInt32(MemoryLayout<Unmanaged<CFString>?>.size); AudioObjectGetPropertyData(outDev, &aUID, 0, nil, &usz, &uref)
-let outputUID = (uref?.takeRetainedValue() as String?) ?? ""
+var outputUID = (uref?.takeRetainedValue() as String?) ?? ""   // var: rebuilt on default-output change (self-health)
 
 // ---- per-source state (reference type; ioProc mutates via device dict) --
 final class Src {
@@ -50,6 +50,34 @@ let lock = NSLock()
 var byAgg: [AudioDeviceID: Src] = [:]     // ioProc: inID -> src
 var byObj: [AudioObjectID: Src] = [:]     // registry: obj -> src
 let SR = 48000.0
+var lastRender: CFTimeInterval = 0        // ioProc render stamp (lock-owned); 0 = nothing rendered yet
+
+// ---- CONTROL PLANE v1 shared state -----------------------------------------
+// Contract: ~/.hermes/vaults/Hermes-Plans/orbit-control-plane-v1.md. A client is
+// "proto" ONLY if it connects /stream with proto=1; proto-less clients see today's
+// behavior byte-for-byte (no hello, no elected, no new events). All cp state is
+// cpLock-owned. Declared EARLY: async tap workers call cpBroadcast as soon as
+// they spawn, before later top-level init has run (Swift top-level vars init in
+// source order — a late declaration here would be a boot-time race/crash).
+let EPOCH = Int(Date().timeIntervalSince1970)     // sidecar boot epoch (unix seconds)
+final class HelloRec { var conn: NWConnection?; var version = ""; var lastHello = Date.distantPast }
+let cpLock = NSLock()
+var roster: [String: HelloRec] = [:]              // bootId -> presence (cpLock)
+var mainBoot: String? = nil                       // current elected main (cpLock)
+var protoConns: [NWConnection] = []               // every live proto SSE conn (cpLock)
+func cpSend(_ c: NWConnection, _ event: String, _ data: String) { send(c, "event: \(event)\ndata: \(data)\n\n") }
+func cpBroadcast(_ event: String, _ data: String) {
+    let msg = "event: \(event)\ndata: \(data)\n\n"
+    cpLock.lock(); let cs = protoConns; cpLock.unlock()
+    var alive: [NWConnection] = []
+    for c in cs where c.state == .ready { send(c, msg); alive.append(c) }
+    cpLock.lock(); protoConns = alive; cpLock.unlock()
+}
+func sourcesArr() -> String {                     // the JSON array behind GET /sources
+    lock.lock(); let srcs = Array(byObj.values); lock.unlock()
+    let arr = srcs.map { "{\"obj\":\($0.obj),\"pid\":\($0.pid),\"name\":\"\($0.name.replacingOccurrences(of: "\"", with: ""))\",\"icon\":\"\($0.icon)\"}" }
+    return "[" + arr.joined(separator: ",") + "]"
+}
 
 // ---- ps enumeration (verbatim v9) -----------------------------------------
 func runPS() -> [(pid_t, String)] {
@@ -139,6 +167,7 @@ let ioProc: @convention(c) (AudioObjectID, UnsafePointer<AudioTimeStamp>, Unsafe
     lock.lock(); defer { lock.unlock() }
     guard let src = byAgg[inID] else { return noErr }
     src.lastSeen = CACurrentMediaTime()
+    lastRender = src.lastSeen   // stall watchdog: last time CoreAudio actually rendered to us
     for i in 0..<Int(abl.mNumberBuffers) {
         let buf = withUnsafePointer(to: abl.mBuffers) { $0.advanced(by: i).pointee }
         let nb = Int(buf.mDataByteSize); guard let base = buf.mData, nb >= 4 else { continue }
@@ -172,6 +201,7 @@ func tapObj(_ label: String, _ obj: AudioObjectID, _ pid: pid_t) {
         let s = Src(label, obj, pid, made.tap, made.agg, ioID!)
         lock.lock(); byAgg[made.agg] = s; byObj[obj] = s; lock.unlock()
         log("tap+\(label) obj=\(obj) agg=\(made.agg)")
+        cpBroadcast("sources", sourcesArr())   // control plane: tap set changed
     }
 }
 func retire(_ s: Src) {
@@ -180,6 +210,7 @@ func retire(_ s: Src) {
         AudioHardwareDestroyAggregateDevice(s.agg); AudioHardwareDestroyProcessTap(s.tap)
         lock.lock(); byAgg.removeValue(forKey: s.agg); byObj.removeValue(forKey: s.obj); lock.unlock()
         log("tap-\(s.label)")
+        cpBroadcast("sources", sourcesArr())   // control plane: tap set changed
     }
 }
 func scan() {
@@ -709,6 +740,108 @@ func unduckOrResume() {
     }
 }
 
+// ---- CONTROL PLANE v1 (election, snapshot handshake, push) -----------------
+// Shared state + cpSend/cpBroadcast/sourcesArr live UP TOP (early-declared —
+// async tap workers reach them before later top-level init). Events flow on the
+// SAME SSE conn as levels (channel-A style: no id lines — A frames never had them).
+// main = boot id that POSTed /hello MOST RECENTLY and has a live proto SSE conn.
+// Called on every /hello, every proto attach, and the prune timer. On change the
+// new main gets {you:true}, the demoted one {you:false} (if still connected).
+func cpElection() {
+    cpLock.lock()
+    var best: (String, Date)? = nil
+    for (b, r) in roster where r.conn?.state == .ready && r.lastHello != Date.distantPast {
+        if best == nil || r.lastHello > best!.1 { best = (b, r.lastHello) }
+    }
+    let newMain = best?.0; let oldMain = mainBoot
+    let changed = newMain != oldMain; mainBoot = newMain
+    let nc = newMain.flatMap { roster[$0]?.conn }; let oc = oldMain.flatMap { roster[$0]?.conn }
+    cpLock.unlock()
+    guard changed else { return }
+    log("cp-election main=\(newMain ?? "none") (was \(oldMain ?? "none"))")
+    if let c = nc, c.state == .ready, let m = newMain { cpSend(c, "elected", "{\"you\":true,\"main\":\"\(m)\"}") }
+    if let c = oc, c.state == .ready { cpSend(c, "elected", "{\"you\":false,\"main\":\"\(newMain ?? "")\"}") }
+}
+// A proto SSE conn attached: register (boot may arrive later via POST /hello),
+// run election, then answer the full-state snapshot IMMEDIATELY (reconnect==resync).
+func cpAttach(_ conn: NWConnection, _ boot: String?) {
+    cpLock.lock(); protoConns.append(conn)
+    if let b = boot, !b.isEmpty { let r = roster[b] ?? HelloRec(); r.conn = conn; roster[b] = r }
+    cpLock.unlock()
+    cpElection()
+    cpLock.lock(); let you = boot.map { !$0.isEmpty && mainBoot == $0 } ?? false; cpLock.unlock()
+    npLock.lock(); let np = npCache; npLock.unlock()
+    cpSend(conn, "hello", "{\"epoch\":\(EPOCH),\"proto\":1,\"version\":\"\(SIDECAR_VERSION)\",\"elected\":\(you),\"sources\":\(sourcesArr()),\"nowplaying\":\(np)}")
+}
+// Roster pruning: hello older than 30s with NO live conn is dropped; a dead conn
+// drops to nil so the same boot can re-attach. Then re-elect (standby takes over).
+func cpPrune() {
+    cpLock.lock()
+    let now = Date()
+    for (b, r) in roster where r.conn?.state != .ready {
+        r.conn = nil
+        if now.timeIntervalSince(r.lastHello) > 30 { roster.removeValue(forKey: b); log("cp-prune \(b)") }
+    }
+    protoConns = protoConns.filter { $0.state == .ready }
+    cpLock.unlock()
+    cpElection()
+}
+// ---- /ctl command channel: one versioned door for all verbs -----------------
+// Unknown cmd => {ok:false,err:"unknown-cmd"} at HTTP 200 (never a silent 404).
+// Legacy endpoints stay untouched; these dispatch to the SAME handler logic.
+func ctlDispatch(_ cmd: String, _ args: [String: Any]) -> (Bool, String) {   // (ok, resultJSON | err)
+    switch cmd {
+    case "mode":       return ChannelB.shared.ctlMode(args)        // same verbs as POST /b/mode
+    case "inject":     return ChannelB.shared.ctlInject(args)      // same as POST /b/inject
+    case "tts-speak":  return ChannelB.shared.ctlSpeak(args)       // same as POST /b/tts/speak
+    case "mic-mute":   return ChannelB.shared.ctlMicMute(args)     // == /b/mode {"stt":!mute}
+    case "duck":       let on = (args["on"] as? Bool) ?? true      // == POST /command duck|unduck
+                        if on { duckOrPause() } else { unduckOrResume() }
+                        return (true, "{\"ducked\":\(ducked)}")
+    case "speaker-mute": return (true, "{\"noop\":true}")          // NO speaker-mute verb exists yet — noop, do NOT invent audio behavior
+    default:           return (false, "unknown-cmd")
+    }
+}
+
+// ---- SELF-HEALTH (blueprint §5) ----------------------------------------------
+// Default-output-device listener + IOProc stall watchdog, both feeding ONE
+// rebuild path built from the SAME tap lifecycle as startup. The rebuild runs on
+// its own serial queue: a wedged coreaudiod can stall rebuilds only, never the
+// HTTP plane / channel B / main runloop (same hardening doctrine as tapObj).
+let rebuildQ = DispatchQueue(label: "orbit.rebuild")
+var rebuildWork: DispatchWorkItem?      // rebuildQ-owned only
+func rebuildTaps(_ reason: String) {    // CALL ONLY ON rebuildQ
+    var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: AudioObjectPropertyElement(0))
+    var d = AudioObjectID(0); var s = UInt32(4)
+    let got = (AudioObjectGetPropertyData(hw, &a, 0, nil, &s, &d) == noErr) && d != 0
+    if reason == "device-change", got, d == outDev { return }   // no-op churn (e.g. listener fired by our own aggregate)
+    log("REBUILD reason=\(reason)")
+    if got {                            // re-resolve the output plane BEFORE re-tapping
+        outDev = d
+        var au = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: AudioObjectPropertyElement(0))
+        var ur: Unmanaged<CFString>?; var us = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        AudioObjectGetPropertyData(d, &au, 0, nil, &us, &ur)
+        outputUID = (ur?.takeRetainedValue() as String?) ?? ""
+    }
+    lock.lock(); let all = Array(byObj.values); lock.unlock()
+    for t in all {                      // synchronous teardown on rebuildQ (blocking CoreAudio stays off main)
+        AudioDeviceStop(t.agg, t.ioID); AudioDeviceDestroyIOProcID(t.agg, t.ioID)
+        AudioHardwareDestroyAggregateDevice(t.agg); AudioHardwareDestroyProcessTap(t.tap)
+        lock.lock(); byAgg.removeValue(forKey: t.agg); byObj.removeValue(forKey: t.obj); lock.unlock()
+    }
+    lastRender = 0
+    scan()                              // same spawn path as startup (tap+/tap- broadcast sources)
+}
+var cpDevAddr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: AudioObjectPropertyElement(0))
+AudioObjectAddPropertyListenerBlock(hw, &cpDevAddr, rebuildQ) { _, _ in
+    rebuildQ.async {                    // 1s debounce: DAC flap / aggregate churn fires bursts
+        rebuildWork?.cancel()
+        let w = DispatchWorkItem { rebuildTaps("device-change") }
+        rebuildWork = w
+        rebuildQ.asyncAfter(deadline: .now() + 1, execute: w)
+    }
+}
+
 let server = try! NWListener(using: .tcp, on: PORT)
 func handle(_ conn: NWConnection, _ req: String) {
     let first = req.split(separator: "\r\n").first.map(String.init) ?? ""
@@ -720,16 +853,23 @@ func handle(_ conn: NWConnection, _ req: String) {
     if method == "OPTIONS" {
         conn.send(content: "HTTP/1.1 204 No Response\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n\r\n".data(using: .utf8), completion: .contentProcessed { _ in conn.cancel() }); return
     }
-    if path == "/stream" {
+    if path == "/stream" || path.hasPrefix("/stream?") {
         send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n")
         sseLock.lock(); sseConns.append(conn); sseLock.unlock()
+        if path.hasPrefix("/stream?") {          // control plane: proto=1 opts in; proto-less query params change NOTHING
+            let q = String(path.dropFirst("/stream?".count))
+            func qp(_ k: String) -> String? {
+                for kv in q.split(separator: "&") {
+                    let p = kv.split(separator: "=", maxSplits: 1)
+                    if p.count == 2, String(p[0]) == k { return String(p[1]).removingPercentEncoding ?? String(p[1]) }
+                }
+                return nil
+            }
+            if qp("proto") == "1" { cpAttach(conn, qp("boot")) }
+        }
         return
     }
-    if path == "/sources" {
-        lock.lock(); let srcs = Array(byObj.values); lock.unlock()
-        let arr = srcs.map { "{\"obj\":\($0.obj),\"pid\":\($0.pid),\"name\":\"\($0.name.replacingOccurrences(of: "\"", with: ""))\",\"icon\":\"\($0.icon)\"}" }
-        httpResp(conn, "200 OK", "application/json", "{\"sources\":[" + arr.joined(separator: ",") + "]}"); return
-    }
+    if path == "/sources" { httpResp(conn, "200 OK", "application/json", "{\"sources\":" + sourcesArr() + "}"); return }
     if path == "/volume" { httpResp(conn, "200 OK", "application/json", "{\"vol\":\(curVol()),\"ducked\":\(ducked)}"); return }
     if path == "/npdbg" {
         let d = npDiag(); let body = (try? JSONSerialization.data(withJSONObject: d)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
@@ -750,6 +890,36 @@ func handle(_ conn: NWConnection, _ req: String) {
             httpResp(conn, "200 OK", "application/json", "{\"ok\":true,\"claimed\":true}"); return }
         if req.contains("unduck") { unduckOrResume() } else if req.contains("duck") { duckOrPause() }
         httpResp(conn, "200 OK", "application/json", "{\"ok\":true,\"ducked\":\(ducked)}"); return
+    }
+    if method == "POST" && path == "/hello" {
+        // Control-plane presence + heartbeat: {"boot":"<id>","version":"..."}.
+        // Re-POST refreshes lastSeen (heartbeat). main==true iff this boot is the
+        // current elected main (most recent hello WITH a live proto SSE conn).
+        guard let sep = req.range(of: "\r\n\r\n"),
+              let j = (try? JSONSerialization.jsonObject(with: Data(req[sep.upperBound...].utf8))) as? [String: Any],
+              let boot = j["boot"] as? String, !boot.isEmpty else {
+            httpResp(conn, "400 Bad Request", "application/json", "{\"ok\":false,\"err\":\"bad-hello\"}"); return
+        }
+        cpLock.lock(); let r = roster[boot] ?? HelloRec(); r.lastHello = Date()
+        if let v = j["version"] as? String { r.version = v }
+        roster[boot] = r; cpLock.unlock()
+        cpElection()
+        cpLock.lock(); let isMain = mainBoot == boot; cpLock.unlock()
+        httpResp(conn, "200 OK", "application/json", "{\"ok\":true,\"main\":\(isMain),\"epoch\":\(EPOCH)}")
+        return
+    }
+    if method == "POST" && path == "/ctl" {
+        // One versioned command door: {seq,cmd,args} -> {seq,ok,result|err} (HTTP 200 always).
+        var seq = 0; var cmd = ""; var args: [String: Any] = [:]
+        if let sep = req.range(of: "\r\n\r\n"), let j = (try? JSONSerialization.jsonObject(with: Data(req[sep.upperBound...].utf8))) as? [String: Any] {
+            seq = (j["seq"] as? NSNumber)?.intValue ?? 0
+            cmd = (j["cmd"] as? String) ?? ""
+            args = (j["args"] as? [String: Any]) ?? [:]
+        }
+        let r = ctlDispatch(cmd, args)
+        if r.0 { httpResp(conn, "200 OK", "application/json", "{\"seq\":\(seq),\"ok\":true,\"result\":\(r.1)}") }
+        else { httpResp(conn, "200 OK", "application/json", "{\"seq\":\(seq),\"ok\":false,\"err\":\"\(r.1)\"}") }
+        return
     }
     if path == "/mrprobe" {
         // Diagnostic: what the in-session Now Playing bus read returns.
@@ -804,7 +974,13 @@ server.newConnectionHandler = { conn in
         if let d = data, let s = String(data: d, encoding: .utf8) { handle(conn, s) }
     }
 }
-server.stateUpdateHandler = { st in if case .ready = st { log("listening :\(PORT)") } else { log("state \(st)") } }
+var booted = false   // one-shot: announce sidecar-boot once the plane is up
+server.stateUpdateHandler = { st in
+    if case .ready = st {
+        log("listening :\(PORT)")
+        if !booted { booted = true; DispatchQueue.global().asyncAfter(deadline: .now() + 1) { cpBroadcast("sidecar-boot", "{\"epoch\":\(EPOCH),\"proto\":1}") } }
+    } else { log("state \(st)") }
+}
 server.start(queue: .global(qos: .userInteractive))
 DispatchQueue.global(qos: .userInitiated).async { ChannelB.shared.start() }   // channel B: engines (daemon/mic/TTS) come up off the main thread — AVAudioEngine init must never gate the HTTP plane
 
@@ -828,8 +1004,19 @@ every(4.0) { scan() }
 // channel B pump @0.2s — flush_ms timeouts, heartbeat, queue drain
 every(0.2) { ChannelB.shared.pump() }
 // now-playing poll @1s on main (NSAppleScript must run on the main thread)
+// control plane: publish `nowplaying` ONLY when the cache content actually changed.
 DispatchQueue.global(qos: .utility).async {
-    while true { let j = readNowPlaying(); npLock.lock(); npCache = j; npLock.unlock(); Thread.sleep(forTimeInterval: 2.0) }
+    while true { let j = readNowPlaying(); npLock.lock(); let chg = (j != npCache); npCache = j; npLock.unlock(); if chg { cpBroadcast("nowplaying", j) }; Thread.sleep(forTimeInterval: 2.0) }
+}
+// control plane: roster pruning + election sweep @5s (main drop => standby takes
+// over within one sweep; hello >30s with no live conn is dropped).
+every(5.0) { cpPrune() }
+// self-health: stall watchdog @5s — taps claim live but CoreAudio has not rendered
+// to us for >15s => rebuild in place. Conservative: only fires once we HAVE
+// rendered at least one frame since boot/rebuild (a quiet machine must not storm).
+every(5.0) {
+    lock.lock(); let active = !byObj.isEmpty; let lr = lastRender; lock.unlock()
+    if active, lr > 0, CACurrentMediaTime() - lr > 15 { log("stall: no render for >15s"); rebuildQ.async { rebuildTaps("stall") } }
 }
 
 // ---- GUI / WindowServer connection (required for the Now Playing bus) ----
