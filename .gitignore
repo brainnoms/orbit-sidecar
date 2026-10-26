@@ -1,0 +1,17 @@
+# build artifacts (build.sh regenerates; binaries must never be tracked)
+main.swift
+version.swift
+mr_*.o
+libOrbitNP.dylib
+orbit-sidecar
+orbit-sidecar-b
+orbit-sidecar-c
+orbit-sidecar-mr
+orbit-sidecar-cpv1
+orbit-sidecar.fallback
+orbit-sidecar.pre-*.bak
+# runtime logs & scratch
+*.log
+*.err
+archive/
+mediaremote-mini.bak.*/
