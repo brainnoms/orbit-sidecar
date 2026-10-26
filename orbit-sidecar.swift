@@ -26,6 +26,13 @@ var outDev = AudioObjectID(0); var dsz = UInt32(4); AudioObjectGetPropertyData(h
 var aUID = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: AudioObjectPropertyElement(0))
 var uref: Unmanaged<CFString>?; var usz = UInt32(MemoryLayout<Unmanaged<CFString>?>.size); AudioObjectGetPropertyData(outDev, &aUID, 0, nil, &usz, &uref)
 var outputUID = (uref?.takeRetainedValue() as String?) ?? ""   // var: rebuilt on default-output change (self-health)
+// Thread-safety law (bite 2026-10-26): outputUID is written from rebuildQ and read
+// by concurrent tap workers; a torn Swift String write POISONS the value for the
+// whole process — every later aggregate creation fails until reboot of the binary.
+// All access goes through uidLock. Never read the var directly.
+let uidLock = NSLock()
+func getOutputUID() -> String { uidLock.lock(); defer { uidLock.unlock() }; return outputUID }
+func setOutputUID(_ s: String) { uidLock.lock(); outputUID = s; uidLock.unlock() }
 
 // ---- per-source state (reference type; ioProc mutates via device dict) --
 final class Src {
@@ -144,16 +151,17 @@ func enumerateTargets() -> [(label: String, obj: AudioObjectID, pid: pid_t)] {
 
 // ---- tap + aggregate (verbatim v9) ---------------------------------------
 func makeTap(_ obj: AudioObjectID) -> (tap: AudioObjectID, agg: AudioDeviceID)? {
+    let uid = getOutputUID()   // snapshot once: dict must not straddle a rebuild
     let uuid = UUID(); let desc = CATapDescription(stereoMixdownOfProcesses: [obj]); desc.uuid = uuid; desc.muteBehavior = CATapMuteBehavior.unmuted
     var tapID = AudioObjectID(0); guard AudioHardwareCreateProcessTap(desc, &tapID) == noErr else { return nil }
     let comp: [String: Any] = [
         kAudioAggregateDeviceNameKey: "Orbit \(uuid.uuidString.prefix(4))",
         kAudioAggregateDeviceUIDKey: UUID().uuidString,
-        kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+        kAudioAggregateDeviceMainSubDeviceKey: uid,
         kAudioAggregateDeviceIsPrivateKey: true,
         kAudioAggregateDeviceIsStackedKey: false,
         kAudioAggregateDeviceTapAutoStartKey: true,
-        kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
+        kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: uid]],
         kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: uuid.uuidString]],
     ]
     var agg = AudioDeviceID(0); guard AudioHardwareCreateAggregateDevice(comp as CFDictionary, &agg) == noErr else { AudioHardwareDestroyProcessTap(tapID); return nil }
@@ -284,7 +292,7 @@ func duck() {
         duckStarted = Date().timeIntervalSince1970
         var els: [Int] = []; var chs: [String] = []
         for el in [0, 1, 2] { let v = readVol(outDev, el); if v >= 0 { els.append(el); chs.append("\"\(el)\":\(v)") } }  // LIVE scalars, synchronous, per-channel — never cachedVol
-        writeJSONAtomic(DUCK_SNAP, "{\"device\":\"\(outputUID)\",\"taken_at\":\(duckStarted),\"channels\":{\(chs.joined(separator: ","))}}")
+        writeJSONAtomic(DUCK_SNAP, "{\"device\":\"\(getOutputUID())\",\"taken_at\":\(duckStarted),\"channels\":{\(chs.joined(separator: ","))}}")
         writeJSONAtomic(DUCK_LEASE, "{\"pid\":\(getpid()),\"started_at\":\(duckStarted),\"heartbeat\":\(duckStarted)}")
         for el in els { writeVol(outDev, el, DUCK_FLOOR) }
         cachedVol = DUCK_FLOOR
@@ -836,7 +844,7 @@ func rebuildTaps(_ reason: String) {    // CALL ONLY ON rebuildQ
         var au = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: AudioObjectPropertyElement(0))
         var ur: Unmanaged<CFString>?; var us = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         AudioObjectGetPropertyData(d, &au, 0, nil, &us, &ur)
-        outputUID = (ur?.takeRetainedValue() as String?) ?? ""
+        setOutputUID((ur?.takeRetainedValue() as String?) ?? "")
     }
     lock.lock(); let all = Array(byObj.values); lock.unlock()
     for t in all {                      // synchronous teardown on rebuildQ (blocking CoreAudio stays off main)
@@ -1029,9 +1037,18 @@ every(5.0) { cpPrune() }
 // self-health: stall watchdog @5s — taps claim live but CoreAudio has not rendered
 // to us for >15s => rebuild in place. Conservative: only fires once we HAVE
 // rendered at least one frame since boot/rebuild (a quiet machine must not storm).
+// Second rule (bite 2026-10-26): the OTHER wedge is never rendered AT ALL — the
+// initial grab failed (poisoned device UID / coreaudiod busy mid handoff). Zero
+// sources + live targets 20s after boot => full rebuild, at most once a minute.
+let bootTime = CACurrentMediaTime()
+var noTapsRebuildAt: CFTimeInterval = 0
 every(5.0) {
     lock.lock(); let active = !byObj.isEmpty; let lr = lastRender; lock.unlock()
     if active, lr > 0, CACurrentMediaTime() - lr > 15 { log("stall: no render for >15s"); rebuildQ.async { rebuildTaps("stall") } }
+    if !active, CACurrentMediaTime() - bootTime > 20, CACurrentMediaTime() - noTapsRebuildAt > 60, !enumerateTargets().isEmpty {
+        noTapsRebuildAt = CACurrentMediaTime()
+        log("self-heal: zero taps 20s after boot — rebuilding"); rebuildQ.async { rebuildTaps("no-taps") }
+    }
 }
 
 // ---- GUI / WindowServer connection (required for the Now Playing bus) ----
