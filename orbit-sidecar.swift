@@ -586,13 +586,28 @@ func providerMediaRemote() -> NowPlaying? {
     return np
 }
 // Commit a bus record to the shared artwork pipeline and emit the plugin JSON.
-// Bus artwork arrives atomically WITH the track (same dict), so no settle lag.
+// The bus is NOT reliably atomic: at a track change the record can carry the
+// new text while `artworkData` still holds the PREVIOUS track's bytes (caught
+// in the wild 2026-10-26: card showed the old cover under the new headline).
+// So the bus path obeys the same settle law as the Apple Events path: never
+// commit the previous cover under a new key — hold while the hash equals the
+// last track's art until the bytes differ or a 3s grace expires (same-album
+// case), during which the key has no artv and the panel shows a neutral tile.
 func npBusJSON(_ np: NowPlaying) -> String {
     let key = np.app + "|" + np.track
     if let ad = np.art {
         let h = SHA256.hash(data: ad).map { String(format: "%02x", $0) }.joined()
+        let now = CACurrentMediaTime()
+        if key != npLastKey { npLastKey = key; artSettle = now + 3.0 }
         artLock.lock()
-        if artKey != key || artHash != h { artBytes = ad; artType = np.artMime; artKey = key; artHash = h; artPrevHash = h }
+        if artKey != key || artHash != h {
+            if artKey != key && h == artPrevHash && now < artSettle {
+                // settle pending: bytes still match the previous track's art —
+                // leave the old art under the old key; this key stays art-less.
+            } else {
+                artBytes = ad; artType = np.artMime; artKey = key; artHash = h; artPrevHash = h
+            }
+        }
         artLock.unlock()
     }
     artLock.lock(); let ver = (artKey == key && !artBytes.isEmpty) ? artHash : ""; artLock.unlock()
