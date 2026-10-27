@@ -247,6 +247,22 @@ func retire(_ s: Src) {
         cpBroadcast("sources", sourcesArr())   // control plane: tap set changed
     }
 }
+// ⟦NO-ZOMBIES⟧ exit teardown. kickstart/watchdog SIGTERM used to kill us HOLDING
+// live private aggregates + process taps; coreaudiod keeps them as runtime garbage.
+// Caught live 2026-10-26: fresh coreaudiod (relaunched 15:44) re-rotted to zero-taps
+// by evening across ~6 deploys — each one leaked its whole tap set. Dispose every
+// tracked tap before exiting. If the daemon is wedged these calls block in mach_msg
+// and launchd escalates to SIGKILL anyway — no worse than today; on a healthy daemon
+// the leak ends here.
+func disposeAllTaps() {
+    lock.lock(); let all = Array(byAgg.values); lock.unlock()
+    for s in all {
+        AudioDeviceStop(s.agg, s.ioID); AudioDeviceDestroyIOProcID(s.agg, s.ioID)
+        AudioHardwareDestroyAggregateDevice(s.agg); AudioHardwareDestroyProcessTap(s.tap)
+    }
+}
+signal(SIGTERM) { _ in disposeAllTaps(); _exit(0) }
+signal(SIGINT)  { _ in disposeAllTaps(); _exit(0) }
 func scan() {
     pruneClaims()   // expired leases drop out; enumerateTargets then retires their taps
     let targets = enumerateTargets()
@@ -414,14 +430,14 @@ func runOA(_ src: String, _ timeout: Double) -> String? {
     if sem.wait(timeout: .now() + timeout) == .timedOut { p.interrupt(); p.terminate(); return nil }
     return res
 }
-func npJSON(_ app: String, _ st: String, _ rec: String, pos: Double = 0) -> String {
+func npJSON(_ app: String, _ st: String, _ rec: String, pos: Double = 0, dur: Double = 0) -> String {
     let f = rec.components(separatedBy: "\n")
     let trk = f.count > 0 ? f[0] : ""
     let key = trk.isEmpty ? "" : (app + "|" + trk)
     artLock.lock(); let ver = (artKey == key && !artBytes.isEmpty) ? artHash : ""; artLock.unlock()
     let d: [String: Any] = ["app": app, "state": st,
         "track": trk, "artist": f.count > 1 ? f[1] : "",
-        "album": f.count > 2 ? f[2] : "", "pos": pos, "art": key, "artv": ver]
+        "album": f.count > 2 ? f[2] : "", "pos": pos, "dur": dur, "art": key, "artv": ver]
     guard let j = try? JSONSerialization.data(withJSONObject: d), let s = String(data: j, encoding: .utf8) else {
         return "{\"app\":\"\",\"track\":\"\",\"artist\":\"\",\"album\":\"\",\"state\":\"\",\"pos\":0}"
     }
@@ -693,7 +709,7 @@ func readNowPlaying() -> String {
         guard (runOA("tell application \"System Events\" to return (name of processes) contains \"\(app)\"", 0.8) ?? "") == "true" else { continue }
         let st = runOA("tell application \"\(app)\" to return \"\" & (player state)", 0.8) ?? ""
         guard st == "playing" || st == "paused" else { continue }
-        guard let rec = runOA("tell application \"\(app)\" to return (name of current track) & linefeed & (artist of current track) & linefeed & (album of current track)", 0.8) else { continue }
+        guard let rec = runOA("tell application \"\(app)\" to return (name of current track) & linefeed & (artist of current track) & linefeed & (album of current track) & linefeed & ((duration of current track) as string)", 0.8) else { continue }
         // Artwork settle: Apple Music's `artwork` property LAGS `current track`.
         // Never commit the previous cover under the new key. Re-grab each poll
         // until the bytes actually differ from the last track's art; only after a
@@ -728,7 +744,11 @@ func readNowPlaying() -> String {
         // ⟦MR-STALE⟧ fallback carries position too — the bar and the position-advance
         // clock need it; one extra 0.8s query is nothing on this (cold) path.
         let fpos = Double(runOA("tell application \"\(app)\" to return (player position as string)", 0.8) ?? "") ?? 0
-        return npJSON(app, st, rec, pos: fpos)
+        // duration arrived as line 4 of rec — Music reports seconds, Spotify ms.
+        let rd = rec.components(separatedBy: "\n")
+        var fdur = Double(rd.count > 3 ? rd[3] : "") ?? 0
+        if app == "Spotify" { fdur /= 1000.0 }
+        return npJSON(app, st, rec, pos: fpos, dur: fdur)
     }
     return empty
 }
@@ -891,6 +911,7 @@ func ctlDispatch(_ cmd: String, _ args: [String: Any]) -> (Bool, String) {   // 
     case "inject":     return ChannelB.shared.ctlInject(args)      // same as POST /b/inject
     case "tts-speak":  return ChannelB.shared.ctlSpeak(args)       // same as POST /b/tts/speak
     case "mic-mute":   return ChannelB.shared.ctlMicMute(args)     // == /b/mode {"stt":!mute}
+    case "media":      return ctlMedia(args["action"] as? String ?? "", args)   // ⟦TRANSPORT⟧ player control: bus first, Apple Events fallback
     case "duck":       let on = (args["on"] as? Bool) ?? true      // == POST /command duck|unduck
                         if on { duckOrPause() } else { unduckOrResume() }
                         return (true, "{\"ducked\":\(ducked)}")
@@ -898,6 +919,73 @@ func ctlDispatch(_ cmd: String, _ args: [String: Any]) -> (Bool, String) {   // 
     default:           return (false, "unknown-cmd")
     }
 }
+
+// ⟦TRANSPORT⟧ /ctl media — write path mirrors the read path's two-witness doctrine:
+// MediaRemote bus command first (works for ANY Now Playing app), Apple Events per-app
+// fallback when the bus refuses or the verb only exists in the app's dictionary
+// (shuffle/repeat/seek/volume are not bus verbs). Unsupported combos answer false
+// with a reason — the card dims those buttons; we never ship one that lies.
+func npAppNow() -> String {
+    npLock.lock(); let j = npCache; npLock.unlock()
+    guard let r = j.range(of: "\"app\":\"") else { return "" }
+    let s = j[r.upperBound...]; guard let e = s.firstIndex(of: "\"") else { return "" }
+    return String(s[..<e])
+}
+func ctlMedia(_ action: String, _ args: [String: Any]) -> (Bool, String) {
+    let app = npAppNow()
+    let oa: (String) -> String? = { runOA("tell application \"\(app)\" to \($0)", 0.8) }
+    func transport(_ code: Int, _ verb: String) -> (Bool, String) {
+        if sendMediaCommand(code) { return (true, "{\"via\":\"bus\"}") }
+        if (app == "Music" || app == "Spotify"), oa(verb) != nil { return (true, "{\"via\":\"applescript\"}") }
+        return (false, "no-transport")
+    }
+    switch action {
+    case "toggle": return transport(2, "playpause")
+    case "play":   return transport(0, "play")
+    case "pause":  return transport(1, "pause")
+    case "next":   return transport(4, "next track")
+    case "prev":   return transport(3, "previous track")
+    case "shuffle":
+        let on = (args["on"] as? Bool) ?? true
+        if app == "Music"   { return oa("set shuffle enabled to \(on)") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "shuffle-failed") }
+        if app == "Spotify" { return oa("set shuffling to \(on)")        != nil ? (true, "{\"via\":\"applescript\"}") : (false, "shuffle-failed") }
+        return (false, "shuffle-unsupported")
+    case "repeat":
+        let m = args["mode"] as? String ?? "off"
+        if app == "Music" {
+            let v = m == "one" ? "one" : m == "all" ? "all" : "off"
+            return oa("set song repeat to \(v)") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "repeat-failed")
+        }
+        if app == "Spotify" {
+            let v = m == "one" ? "one" : m == "all" ? "all" : "none"
+            return oa("set repeating to \(v)") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "repeat-failed")
+        }
+        return (false, "repeat-unsupported")
+    case "seek-rel":
+        let secs = (args["secs"] as? NSNumber)?.doubleValue ?? 0
+        if app == "Music" {
+            return oa("set p to (player position) + \(secs)\nif p < 0 then set p to 0\nset player position to p") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed")
+        }
+        if app == "Spotify" {
+            return oa("set p to (track position) + \(Int(secs * 1000))\nif p < 0 then set p to 0\nset track position to p") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed")
+        }
+        return (false, "seek-unsupported")   // bus seek needs an options dict — adapter speaks bare codes
+    case "seek-abs":
+        let pos = (args["pos"] as? NSNumber)?.doubleValue ?? 0
+        if app == "Music"   { return oa("set player position to \(max(0, pos))") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed") }
+        if app == "Spotify" { return oa("set track position to \(max(0, Int(pos * 1000)))") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed") }
+        return (false, "seek-unsupported")
+    case "set-volume":
+        let vol = max(0.0, min(1.0, (args["vol"] as? NSNumber)?.doubleValue ?? -1))
+        if vol < 0 { return (false, "vol-required") }
+        let pct = Int((vol * 100).rounded())
+        if app == "Music"   { return oa("set sound volume to \(pct)") != nil ? (true, "{\"vol\":\(pct)}") : (false, "volume-failed") }
+        if app == "Spotify" { return oa("set player volume to \(pct)") != nil ? (true, "{\"vol\":\(pct)}") : (false, "volume-failed") }
+        return (false, "volume-unsupported")
+    default: return (false, "unknown-action")
+    }
+}
+
 
 // ---- SELF-HEALTH (blueprint §5) ----------------------------------------------
 // Default-output-device listener + IOProc stall watchdog, both feeding ONE
@@ -1060,6 +1148,18 @@ func handle(_ conn: NWConnection, _ req: String) {
         httpResp(conn, "200 OK", "application/json", body); return
     }
     if path == "/nowplaying" { npLock.lock(); let b = npCache; npLock.unlock(); httpResp(conn, "200 OK", "application/json", b); return }
+    // ⟦TRANSPORT⟧ APP volume read for the card's speaker icon (the old /volume above
+    // is duck-state — different animal, do not merge). Only Music/Spotify expose app
+    // volume. 404 = "this source has no app volume" — the card hides the knob.
+    if path == "/appvolume" {
+        let app = npAppNow()
+        let pair: (String, Double)? = app == "Music" ? ("get sound volume", 100) : app == "Spotify" ? ("get player volume", 100) : nil
+        guard let (verb, div) = pair else { httpResp(conn, "404 Not Found", "application/json", "{\"err\":\"no-app-volume\"}"); return }
+        if let r = runOA("tell application \"\(app)\" to " + verb, 0.8), let v = Double(r.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            httpResp(conn, "200 OK", "application/json", "{\"vol\":\(v / div),\"app\":\"\(app)\"}")
+        } else { httpResp(conn, "502 Bad Gateway", "application/json", "{\"err\":\"query-failed\"}") }
+        return
+    }
     if path.hasPrefix("/artwork") {
         var k = ""
         if let r = path.range(of: "k=") {
