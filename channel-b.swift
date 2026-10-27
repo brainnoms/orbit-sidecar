@@ -466,7 +466,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         bblock.unlock()
         duck()
         bblock.lock(); spoken += 1; bblock.unlock()
-        if !base.isEmpty, !model.isEmpty, !v.isEmpty {
+        if !base.isEmpty, !model.isEmpty {
             // LEVEL 1 (§1): synthesize with the CONFIGURED provider voice, play the
             // returned audio. Blocking HTTP on a worker; playback advances the queue
             // through AVAudioPlayerDelegate — same drain semantics as the AVSpeech path.
@@ -523,13 +523,19 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     func providerSynth(_ base0: String, _ key: String, _ model: String, _ voice: String, _ text: String) -> Data? {
         var u = base0
         while u.hasSuffix("/") { u.removeLast() }
-        guard let url = URL(string: u + "/v1/audio/speech") else { log("provider: bad base URL"); return nil }
+        // base may arrive as host:port or host:port/v1 (renderer voiceCfg carries /v1) —
+        // never stack a second /v1; that 404 silently made every provider turn an OS turn
+        let path = u.hasSuffix("/v1") ? "/audio/speech" : "/v1/audio/speech"
+        guard let url = URL(string: u + path) else { log("provider: bad base URL"); return nil }
         var req = URLRequest(url: url, timeoutInterval: synthTimeout)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !key.isEmpty { req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization") }
-        req.httpBody = (try? JSONSerialization.data(withJSONObject:
-            ["model": model, "input": text, "voice": voice, "response_format": "wav"])) ?? Data()
+        // voice optional by contract: Qwen3-TTS-Base has no roster (random-voice IS its
+        // selection) — sending "" 400s; omitting it lets Base be Base
+        var body: [String: Any] = ["model": model, "input": text, "response_format": "wav"]
+        if !voice.isEmpty { body["voice"] = voice }
+        req.httpBody = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
         var data: Data?; var code = 0; var ct = ""; var e: Error?
         let synthT0 = CACurrentMediaTime()   // card C: synth_ms telemetry
         let sem = DispatchSemaphore(value: 0)
@@ -832,7 +838,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // The plugin (card E) reads `version` for sidecar-installed detection -> tooltip "(vX)".
         return "{\"version\":\"\(SIDECAR_VERSION)\",\"build\":\"\(SIDECAR_BUILD)\",\"stt\":{\"state\":\"\(sttState)\",\"engine\":\"\(engineName)\",\"segs\":\(segsDone)},"
              + "\"tts\":{\"state\":\"\(ttsState)\",\"queued\":\(queued.count),\"spoken\":\(spoken),\"mode\":\(jsonStr(lastMode)),"
-             + "\"provider\":{\"configured\":\(!pBase.isEmpty && !pModel.isEmpty && !voiceOverride.isEmpty),\"base\":\(jsonStr(pBase)),\"model\":\(jsonStr(pModel)),\"voice\":\(jsonStr(voiceOverride)),\"errs\":\(providerErrs)}},"
+             + "\"provider\":{\"configured\":\(!pBase.isEmpty && !pModel.isEmpty),\"base\":\(jsonStr(pBase)),\"model\":\(jsonStr(pModel)),\"voice\":\(jsonStr(voiceOverride)),\"errs\":\(providerErrs)}},"
              + "\"mic\":\"\(micOn ? "armed" : "muted")\"}"
     }
 
