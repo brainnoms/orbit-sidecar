@@ -428,7 +428,14 @@ func runOA(_ src: String, _ timeout: Double) -> String? {
     }
     do { try p.run() } catch { return nil }
     if sem.wait(timeout: .now() + timeout) == .timedOut { p.interrupt(); p.terminate(); return nil }
-    return res
+    // ⟦HONEST-VERBS⟧ a failed osascript exits non-zero with EMPTY stdout, which
+    // used to return "" (non-nil) and made every Apple Events fallback report
+    // success on failure. Exit status now decides: error ⇒ nil ⇒ {ok:false}.
+    // waitUntilExit is MANDATORY before reading terminationStatus — Foundation
+    // throws NSException on a live process (this exact line crash-looped the
+    // daemon once; the stdout-EOF read means exit is imminent, so it's fast).
+    p.waitUntilExit()
+    return p.terminationStatus == 0 ? res : nil
 }
 func npJSON(_ app: String, _ st: String, _ rec: String, pos: Double = 0, dur: Double = 0) -> String {
     let f = rec.components(separatedBy: "\n")
@@ -962,18 +969,23 @@ func ctlMedia(_ action: String, _ args: [String: Any]) -> (Bool, String) {
         }
         return (false, "repeat-unsupported")
     case "seek-rel":
+        // Block-form AppleScript: oa() is one-line `tell … to <stmt>` and a
+        // multi-statement script CANNOT ride it — the trailing lines fall out of
+        // the tell block, error, and (pre-HONEST-VERBS) silently "succeeded".
         let secs = (args["secs"] as? NSNumber)?.doubleValue ?? 0
         if app == "Music" {
-            return oa("set p to (player position) + \(secs)\nif p < 0 then set p to 0\nset player position to p") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed")
+            let ok = runOA("tell application \"Music\"\nset p to (player position) + \(secs)\nif p < 0 then set p to 0\ntry\nif p > (duration of current track) then set p to (duration of current track)\nend try\nset player position to p\nend tell", 1.5) != nil
+            return ok ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed")
         }
         if app == "Spotify" {
-            return oa("set p to (track position) + \(Int(secs * 1000))\nif p < 0 then set p to 0\nset track position to p") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed")
+            let ok = runOA("tell application \"Spotify\"\nset p to (track position) + \(Int(secs * 1000))\nif p < 0 then set p to 0\ntry\nif p > (duration of current track) then set p to (duration of current track)\nend try\nset track position to p\nend tell", 1.5) != nil
+            return ok ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed")
         }
         return (false, "seek-unsupported")   // bus seek needs an options dict — adapter speaks bare codes
     case "seek-abs":
         let pos = (args["pos"] as? NSNumber)?.doubleValue ?? 0
-        if app == "Music"   { return oa("set player position to \(max(0, pos))") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed") }
-        if app == "Spotify" { return oa("set track position to \(max(0, Int(pos * 1000)))") != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed") }
+        if app == "Music"   { return runOA("tell application \"Music\" to set player position to \(max(0, pos))", 1.5) != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed") }
+        if app == "Spotify" { return runOA("tell application \"Spotify\" to set track position to \(max(0, Int(pos * 1000)))", 1.5) != nil ? (true, "{\"via\":\"applescript\"}") : (false, "seek-failed") }
         return (false, "seek-unsupported")
     case "set-volume":
         let vol = max(0.0, min(1.0, (args["vol"] as? NSNumber)?.doubleValue ?? -1))
@@ -1158,6 +1170,29 @@ func handle(_ conn: NWConnection, _ req: String) {
         if let r = runOA("tell application \"\(app)\" to " + verb, 0.8), let v = Double(r.trimmingCharacters(in: .whitespacesAndNewlines)) {
             httpResp(conn, "200 OK", "application/json", "{\"vol\":\(v / div),\"app\":\"\(app)\"}")
         } else { httpResp(conn, "502 Bad Gateway", "application/json", "{\"err\":\"query-failed\"}") }
+        return
+    }
+    // ⟦HONEST-VERBS⟧ shuffle/repeat READ-BACK. The bus never reports these, so
+    // until now the card guessed (optimistic memory). Music answers both;
+    // Spotify answers both but has no repeat-ONE (bool → off|all, "one" never
+    // claimed). 404 = app doesn't expose state ⇒ card stays optimistic.
+    if path == "/playerstate" {
+        let app = npAppNow()
+        func yn(_ s: String?) -> String { (s?.trimmingCharacters(in: .whitespacesAndNewlines) == "true") ? "true" : "false" }
+        if app == "Music" {
+            let sh = runOA("tell application \"Music\" to get shuffle enabled", 0.8)
+            let rp = runOA("tell application \"Music\" to get song repeat", 0.8) ?? "off"
+            let rep = ["one": "one", "all": "all"].mapValues { $0 }[rp.trimmingCharacters(in: .whitespacesAndNewlines)] ?? "off"
+            httpResp(conn, "200 OK", "application/json", "{\"app\":\"Music\",\"shuffle\":\(yn(sh)),\"repeat\":\"\(rep)\"}")
+            return
+        }
+        if app == "Spotify" {
+            let sh = runOA("tell application \"Spotify\" to get shuffling", 0.8)
+            let rp = runOA("tell application \"Spotify\" to get repeating", 0.8)
+            httpResp(conn, "200 OK", "application/json", "{\"app\":\"Spotify\",\"shuffle\":\(yn(sh)),\"repeat\":\"\(yn(rp) == "true" ? "all" : "off")\"}")
+            return
+        }
+        httpResp(conn, "404 Not Found", "application/json", "{\"err\":\"no-playerstate\"}")
         return
     }
     if path.hasPrefix("/artwork") {
