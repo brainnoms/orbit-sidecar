@@ -761,7 +761,7 @@ func readNowPlaying() -> String {
 }
 // ---- spoken-vs-music duck/pause (Slice A) -----------------------------------
 // Duck (volume floor) suits MUSIC; SPOKEN content (podcasts, audiobooks) should be
-// PAUSED on interruption and resumed after. Trigger = POST /command (jarvis speech
+// PAUSED on interruption and resumed after. Trigger = POST /command (orbit speech — POST /command"
 // start/end). Strategy: ALWAYS duck instantly (covers the ~1s MediaRemote pause
 // latency AND apps that ignore the pause command — unduck restores it), and ADDITION-
 // ally pause spoken content. On release: unduck + SAFE-RESUME, guarded by a fresh bus
