@@ -1,6 +1,6 @@
 # Channel B — Audio Text Stream (STT out / TTS in)
 
-**Task:** t_50833813 · blueprint §6 (`~/.hermes/vaults/Hermes-Plans/jarvis-telemetry-audio-context-architecture.md`)
+**Task:** t_50833813 · blueprint §6 (`~/.hermes/vaults/Hermes-Plans/orbit-telemetry-audio-context-architecture.md`)
 **Owner:** sidecar (`orbit-sidecar`, Swift, :8107). The sidecar owns the STT/TTS
 engine relationships; the plugin owns thinking. This file is the transport decision + protocol.
 
