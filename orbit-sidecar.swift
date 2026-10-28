@@ -923,6 +923,11 @@ func ctlDispatch(_ cmd: String, _ args: [String: Any]) -> (Bool, String) {   // 
                         if on { duckOrPause() } else { unduckOrResume() }
                         return (true, "{\"ducked\":\(ducked)}")
     case "speaker-mute": return (true, "{\"noop\":true}")          // NO speaker-mute verb exists yet — noop, do NOT invent audio behavior
+    case "stage":      // ⟦DIRECTOR REMOTE⟧ silent stage directives to the plugin:
+                        // attention | flyin | rest — the stage moves, the room stays quiet.
+                        let what = (args["what"] as? String ?? "attention")
+                        cpBroadcast("direct", "{\"what\":\"\(what)\"}")
+                        return (true, "{\"broadcast\":\"direct\",\"what\":\"\(what)\"}")
     default:           return (false, "unknown-cmd")
     }
 }
