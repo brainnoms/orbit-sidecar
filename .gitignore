@@ -15,3 +15,4 @@ orbit-sidecar.pre-*.bak
 *.err
 archive/
 mediaremote-mini.bak.*/
+errside.txt
