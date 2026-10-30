@@ -96,7 +96,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // The player node speaks exactly ONE format (48k stereo). Provider audio is
     // RESAMPLED into it in code: a 24k buffer scheduled into a 48k node doesn't
     // error — it just plays at chipmunk speed (caught live 2026-10-30).
-    let nodeAF = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!         // engine.attach is one-shot per node — twice = NSAssert death
+    // Node format tracks the PROVIDER rate (Kokoro 24k): the engine's own sample-rate
+    // converter does the interpolating — my hand-rolled linear resample (24k→48k) bought
+    // speed at the price of robot voice (Bob, 2026-10-30). Reconnect the node when — and
+    // only when — a different provider rate shows up; the mixer SRCs properly.
+    var nodeRate: Double = 0
+    func nodeFormat(_ r: Double) -> AVAudioFormat { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: r, channels: 2, interleaved: false)! }         // engine.attach is one-shot per node — twice = NSAssert death
     var dumpDir = ProcessInfo.processInfo.environment["ORBIT_TTS_DUMP"] ?? ""   // evidence hook: dump provider bytes here ("off" unless env or /b/mode)
     var daemon: Process?
     var dIn: FileHandle?
@@ -646,22 +651,19 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // scheduleBuffer THROWS the channel-mismatch NSException (caught live 2026-10-30:
         // every provider sentence killed the process mid-syllable). Mono source fans to
         // both channels; the canceller still references the mono source — that's physics.
-        let srOut = 48000.0
-        let nOut = max(1, Int((Double(pcm.count) * (srOut / Double(rate))).rounded()))
-        if pcm.count > 0, let buf = AVAudioPCMBuffer(pcmFormat: nodeAF, frameCapacity: AVAudioFrameCount(nOut)) {
-            buf.frameLength = AVAudioFrameCount(nOut)
+        if pcm.count > 0, let buf = AVAudioPCMBuffer(pcmFormat: nodeFormat(Double(rate)), frameCapacity: AVAudioFrameCount(pcm.count)) {
+            buf.frameLength = AVAudioFrameCount(pcm.count)
             if let ch = buf.floatChannelData {
-                let ratio = Double(rate) / srOut          // source position per output frame
-                let inv = 1.0 / 32768.0
-                for i in 0..<nOut {
-                    let pos = Double(i) * ratio
-                    let i0 = Swift.min(pcm.count - 1, Int(pos)); let i1 = Swift.min(pcm.count - 1, i0 + 1)
-                    let f = Float(pos - Double(i0))
-                    let v = (Float(pcm[i0]) + (Float(pcm[i1]) - Float(pcm[i0])) * f) * inv
-                    ch[0][i] = v; ch[1][i] = v
-                }
+                let scale: Float = 1.0 / 32768.0
+                for i in 0..<pcm.count { let v = Float(pcm[i]) * scale; ch[0][i] = v; ch[1][i] = v }
             }
-            if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: nodeAF); nodeAttached = true }
+            let wantAF = nodeFormat(Double(rate))
+            if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF); nodeAttached = true; nodeRate = Double(rate) }
+            else if nodeRate != Double(rate) {
+                playerNode.stop(); engine.disconnectNodeInput(playerNode)
+                engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF); nodeRate = Double(rate)
+                log("playback node reformat: \(Int(nodeRate))Hz stereo")
+            }
             if !engine.isRunning {
                 engine.prepare()
                 do { try engine.start() } catch { log("playback engine start failed: \(error.localizedDescription) — legacy player, echo NOT cancelled") }
