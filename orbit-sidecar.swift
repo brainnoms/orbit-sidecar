@@ -172,6 +172,16 @@ func enumerateTargets() -> [(label: String, obj: AudioObjectID, pid: pid_t)] {
         let label = (last.contains("Aperitif")) ? "Aperitif:\(pid)" : "\(last):\(pid)"
         targets.append((label, obj, pid))
     }
+    // ⟦THE MIC SHALL NOT HEAR THE SPEAKER⟧ self-tap: our OWN output — provider node AND
+    // AVSpeech fallback — is output. No other process tap can see it and we refuse to
+    // pretend our own voice doesn't echo. If CoreAudio refuses a self-tap, honest miss.
+    do {
+        var a3 = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject, mScope: kAudioObjectPropertyScopeGlobal, mElement: AudioObjectPropertyElement(0))
+        var p = UInt32(getpid()); var obj = AudioObjectID(0); var osz = UInt32(4)
+        if AudioObjectGetPropertyData(hw, &a3, 4, &p, &osz, &obj) == noErr, obj != 0, !seen.contains(obj) {
+            targets.append(("orbit-sidecar(self)", obj, getpid()))
+        } else { log("self-tap: no process object for our pid — own voice uncancellable by tap (provider ref still covers speech)") }
+    }
     return targets
 }
 
