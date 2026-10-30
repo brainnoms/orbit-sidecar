@@ -119,6 +119,24 @@ final class EchoCanceller {
         }
     }
 
+    // THE BRIDGE: hand the browser ear the reference in absolute sample indices
+    // (int16 @16k). The plugin aligns it by lag-locked NLMS — same physics, both ears.
+    func slice(_ from: Int, _ n: Int) -> [Int16] {
+        var out = [Int16](repeating: 0, count: n)
+        if baseT != 0 {
+            for i in 0..<n {
+                let idx = from + i
+                if idx >= 0 {
+                    let v = mix[idx % EC_N] + agt[idx % EC_N]
+                    out[i] = Int16(max(-32767, min(32767, v)))
+                }
+            }
+        }
+        return out
+    }
+    var clockStart: Double { baseT }        // wall time of absolute index 0 (0 = silence)
+    var headIndex: Int { mixWrite }         // newest written absolute index
+
     // dB of speaker output actually removed from the mic — observable or it didn't happen
     func reportAndReset() -> String {
         guard meas > 1000, preE > 1e8 else { meas = 0; preE = 0; errE = 0; return "listening" }

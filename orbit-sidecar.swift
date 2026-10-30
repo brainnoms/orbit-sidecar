@@ -292,6 +292,34 @@ func scan() {
     for (obj, s) in snapshot where !wantObjs.contains(obj) { retire(s) }
 }
 for t in enumerateTargets() { tapObj(t.label, t.obj, t.pid) }
+
+// ⟦THE BRIDGE⟧ the browser ear cannot cancel what it cannot reference. Pump the
+// canceller's timeline (whole-output mixdown + the agent's own bytes, int16 @16k)
+// as base64 chunks every 20ms over the cp plane. Absolute sample index + lead
+// let the plugin schedule ahead of the echo; its NLMS eats the latency. The
+// stream STOPS when the reference goes silent — no audio, no traffic.
+var refSentTo = 0
+let refTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+refTimer.schedule(deadline: .now() + 0.2, repeating: 0.02)
+refTimer.setEventHandler {
+    let t = CACurrentMediaTime()
+    guard canc.clockStart > 0 else { return }
+    guard canc.active else {
+        refSentTo = Int((t - canc.clockStart) * 16000) + 16000   // silence: cursor rides the clock
+        return
+    }
+    let head = Int((t - canc.clockStart) * 16000) + 3200         // 200ms lead: latch before the echo lands
+    let from = max(refSentTo, head - 8000)
+    let n = min(320, head - from)
+    if n >= 64 {
+        let smp = canc.slice(from, n)
+        var d = Data(capacity: smp.count * 2)
+        for v in smp { let u = UInt16(bitPattern: v); d.append(UInt8(u & 0xff)); d.append(UInt8(u >> 8)) }
+        refSentTo = from + n
+        cpBroadcast("ecref", "{\"i\":\(from),\"n\":\(n),\"b\":\"\(d.base64EncodedString())\"}")
+    }
+}
+refTimer.resume()
 log("initial tap spawns=\(enumerateTargets().count)")
 
 // ---- duck: disk-backed LEASE (blueprint §5) --------------------------------
