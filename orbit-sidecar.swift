@@ -246,7 +246,7 @@ func tapObj(_ label: String, _ obj: AudioObjectID, _ pid: pid_t) {
     lock.lock(); if pendingObjs.contains(obj) { lock.unlock(); return }; pendingObjs.insert(obj); lock.unlock()
     DispatchQueue.global(qos: .userInitiated).async {
         defer { lock.lock(); pendingObjs.remove(obj); lock.unlock() }
-        guard let made = makeTap(obj) else { return }
+        guard let made = makeTap(obj) else { if label.contains("self") { log("self-tap REFUSED by CoreAudio — own output uncancellable by tap; provider/AVSpeech refs must carry it") }; return }
         var ioID: AudioDeviceIOProcID?
         if AudioDeviceCreateIOProcID(made.agg, ioProc, nil, &ioID) != noErr || ioID == nil {
             AudioHardwareDestroyAggregateDevice(made.agg); AudioHardwareDestroyProcessTap(made.tap); return
