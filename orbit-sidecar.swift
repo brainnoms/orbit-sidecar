@@ -195,8 +195,13 @@ func makeTap(_ obj: AudioObjectID) -> (tap: AudioObjectID, agg: AudioDeviceID)? 
 }
 
 // ---- realtime ioProc: device->src lookup, accumulate, stamp lastSeen ----
+// THE CANCELLER (see echo-cancel.swift): one global, both planes feed it
+let canc = EchoCanceller()
+
+func machSec(_ host: UInt64) -> Double { var ti = mach_timebase_info(); if mach_timebase_info(&ti) != 0 || ti.denom == 0 { return CACurrentMediaTime() }; return Double(host) * Double(ti.numer) / Double(ti.denom) / 1e9 }
+
 let ioProc: @convention(c) (AudioObjectID, UnsafePointer<AudioTimeStamp>, UnsafePointer<AudioBufferList>, UnsafePointer<AudioTimeStamp>, UnsafeMutablePointer<AudioBufferList>, UnsafePointer<AudioTimeStamp>, UnsafeMutableRawPointer?) -> OSStatus =
-{ inID, _, inData, _, _, _, _ in
+{ inID, inStamp, inData, _, _, _, _ in
     let abl = inData.pointee; guard abl.mNumberBuffers > 0 else { return noErr }
     lock.lock(); defer { lock.unlock() }
     guard let src = byAgg[inID] else { return noErr }
@@ -206,8 +211,13 @@ let ioProc: @convention(c) (AudioObjectID, UnsafePointer<AudioTimeStamp>, Unsafe
         let buf = withUnsafePointer(to: abl.mBuffers) { $0.advanced(by: i).pointee }
         let nb = Int(buf.mDataByteSize); guard let base = buf.mData, nb >= 4 else { continue }
         let cnt = nb / 4; src.frames += Double(cnt) / Double(max(1, Int(buf.mNumberChannels)))
+        let ch_ch = max(1, Int(buf.mNumberChannels)); let chans0 = buf.mData
+        let ch = chans0
         base.withMemoryRebound(to: Float32.self, capacity: cnt) { ch in
             for j in 0..<cnt { let v = Double(ch[j]); let a = abs(v); if a > src.peak { src.peak = a }; src.sumsq += v * v }
+            // ⟦THE MIC SHALL NOT HEAR THE SPEAKER⟧ hand the canceller this render of the whole output
+            let frames = cnt / max(1, ch_ch)
+            if frames > 0 { let hs = machSec(inStamp.pointee.mHostTime); canc.pushMix(ch, frames, ch_ch, at: hs) }
         }
     }
     if src.peak > 0.02 { src.lastLoud = CACurrentMediaTime() }

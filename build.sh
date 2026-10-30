@@ -33,7 +33,7 @@ clang -dynamiclib -fobjc-arc -O2 $MR_INC \
   -Wl,-exported_symbol,_adapter_get_env -Wl,-exported_symbol,_adapter_send_command
 codesign --force --sign - libOrbitNP.dylib >/dev/null 2>&1 || true
 cp orbit-sidecar.swift main.swift
-swiftc -O main.swift channel-b.swift version.swift mr_*.o \
+swiftc -O main.swift channel-b.swift echo-cancel.swift version.swift mr_*.o \
   -import-objc-header orbit-mr-bridge.h \
   -framework CoreAudio -framework AVFoundation -framework Network -framework CryptoKit -framework AppKit -framework UniformTypeIdentifiers \
   -o "$OUT"

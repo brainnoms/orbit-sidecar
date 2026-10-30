@@ -85,7 +85,14 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     var synthInFlight = 0   // provider synthesize calls running RIGHT NOW — the ack
                             // guard must not close a turn whose audio is being cooked
     var lastMode = ""       // provider | avspeech — engine of the most recent utterance
-    var player: AVAudioPlayer?   // LEVEL-1 playback engine (provider WAV bytes)
+    var player: AVAudioPlayerNode?   // ⟦ECHO LAW⟧ LEVEL-1 playback rides the SAME engine as the mic:
+                                     // Apple VPIO cancels what we ourselves play. The old split
+                                     // (AVAudioPlayer out ∥ AVAudioEngine in) cancelled NOTHING —
+                                     // the agent hears itself, media bleeds into STT, wake ghosts follow.
+    var legacy: AVAudioPlayer?       // fallback when the engine can't run — no cancellation, logged honestly
+    var vpio = false                 // Voice Processing IO engaged (AEC + NS + AGC on the mic path)
+    var vpioTried = false
+    var nodeAttached = false         // engine.attach is one-shot per node — twice = NSAssert death
     var dumpDir = ProcessInfo.processInfo.environment["ORBIT_TTS_DUMP"] ?? ""   // evidence hook: dump provider bytes here ("off" unless env or /b/mode)
     var daemon: Process?
     var dIn: FileHandle?
@@ -115,6 +122,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
 
     let speech = AVSpeechSynthesizer()
     let engine = AVAudioEngine()
+    let playerNode = AVAudioPlayerNode()   // playback source inside the VPIO graph
     var micRate: Double = 16000                // actual tap rate after decimation
     var preBuf = [Int16]()                     // pre-roll ring (RAM only)
     var segBuf = [Int16]()
@@ -193,6 +201,9 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     func armMic() {
         bblock.lock(); if micOn { bblock.unlock(); return }; bblock.unlock()
         let input = engine.inputNode
+        // ⟦THE MIC SHALL NOT HEAR THE SPEAKER⟧ no vendor AEC, no opinions: echo-cancel.swift
+        // subtracts the WHOLE output from the mic with our own NLMS — the exact samples the
+        // taps already carry plus the agent's own bytes, reference before the DAC.
         let fmt = input.inputFormat(forBus: 0)
         let step = max(1, Int(fmt.sampleRate / 16000.0))
         micRate = (fmt.sampleRate / Double(step)).rounded()
@@ -209,11 +220,14 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 sumsq += v * v; cnt += 1
                 s[k] = Int16(max(-1.0, min(1.0, v)) * 32767.0); k += 1
             }
-            let rms = cnt > 0 ? (sumsq / cnt).squareRoot() : 0
-            self.vad(s, k, rms)
+            // ⟦THE MIC SHALL NOT HEAR THE SPEAKER⟧ subtract the entire speaker output —
+            // and judge silence on the CANCELLED signal, so the agent never hears itself talk.
+            canc.process(&s, k, at: CACurrentMediaTime())
+            var cs = 0.0; for j in 0..<k { let v = Double(s[j]); cs += v * v }
+            self.vad(s, k, k > 0 ? (cs / Double(k)).squareRoot() : 0)
         }
-        engine.prepare()
-        do { try engine.start() } catch {
+        if !engine.isRunning { engine.prepare() }
+        do { if !engine.isRunning { try engine.start() } } catch {
             log("mic start failed (TCC?): \(error.localizedDescription)")
             setState { micOn = false; sttState = "down" }
             return
@@ -223,7 +237,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
     func disarmMic() {
         bblock.lock(); let was = micOn; micOn = false; bblock.unlock()
-        if was { engine.inputNode.removeTap(onBus: 0); engine.stop() }
+        if was {
+            engine.inputNode.removeTap(onBus: 0)
+            // ⟦ECHO LAW⟧ the engine is now a playback participant too — muting the ear
+            // must never mute the mouth. Stop the IO only when nothing is sounding.
+            if !playerNode.isPlaying && !(legacy?.isPlaying ?? false) && !speech.isSpeaking { engine.stop() }
+        }
         log("mic disarmed")
     }
     func vad(_ s: [Int16], _ n: Int, _ rms: Double) {
@@ -412,7 +431,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 // PROTOCOL end-of-turn — authoritative. TCP isComplete does NOT fire
                 // on keep-alive (curl) and may not fire at the chunk terminator either;
                 // the client says "final" when the turn's text is done. Ack + close.
-                bblock.lock(); ttsEOF = true; streamOpen = false; let qEmpty = queued.isEmpty; let talking = speech.isSpeaking || (player?.isPlaying ?? false); bblock.unlock()
+                bblock.lock(); ttsEOF = true; streamOpen = false; let qEmpty = queued.isEmpty; let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false); bblock.unlock()
                 if qEmpty && !talking { ackTTS() }   // else the delegate/pump acks when the queue drains
                 return
             }
@@ -606,20 +625,50 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         log("normalizeWav16: peak \(peak) gain ×\(String(format: "%.2f", gain))")
         return out
     }
+    // drain after one provider sentence: advance the queue (same discipline as the
+    // AVAudioPlayer delegate — generation-checked so a barge stays silent)
+    func nodeDone(_ gen: Int) {
+        bblock.lock(); let alive = (ttsState == "speaking" && uttGen == gen); bblock.unlock()
+        guard alive else { return }
+        log("tts done (provider) — echo-cancel: \(canc.reportAndReset())")
+        setState { if playerNode.isPlaying || player != nil { player = nil } }
+        DispatchQueue.main.async { self.speakNext() }
+    }
     func playAudio(_ raw: Data) -> Bool {
         let d = Self.normalizeWav16(raw)
-        log("playAudio: \(d.count) bytes, main-thread=\(Thread.isMainThread)")
+        log("playAudio: \(d.count) bytes, main-thread=\(Thread.isMainThread) echo=\(canc.active ? "nlms" : "idle")")
+        let (pcm, rate) = Self.pcm16(fromWAV: d)
+        if pcm.count > 0, let af = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(rate), channels: 1, interleaved: true),
+           let buf = AVAudioPCMBuffer(pcmFormat: af, frameCapacity: AVAudioFrameCount(pcm.count)) {
+            buf.frameLength = AVAudioFrameCount(pcm.count)
+            if let ch = buf.int16ChannelData?[0] { pcm.withUnsafeBufferPointer { src in memcpy(ch, src.baseAddress!, src.count * MemoryLayout<Int16>.size) } }
+            if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: nil); nodeAttached = true }
+            if !engine.isRunning {
+                engine.prepare()
+                do { try engine.start() } catch { log("playback engine start failed: \(error.localizedDescription) — legacy player, echo NOT cancelled") }
+            }
+            if engine.isRunning {
+                bblock.lock(); let gen = uttGen; bblock.unlock()
+                playerNode.stop()
+                playerNode.scheduleBuffer(buf, at: nil, options: []) { [weak self] in self?.nodeDone(gen) }
+                playerNode.play()
+                canc.pushRef(pcm, fromRate: Double(rate), at: CACurrentMediaTime() + 0.015)  // echo ref: its OWN samples
+                setState { player = playerNode; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
+                outFlip(true, "provider")
+                firstAudio("provider")
+                log("provider playback via engine node: dur=\(String(format: "%.1f", Double(pcm.count) / Double(rate)))s wf=\(pcm.count)@\((Int(rate)))Hz echo=\(canc.active ? "nlms" : "idle")")
+                return true
+            }
+        }
+        // legacy path (engine unavailable) — audible but echo uncancelled, said out loud above
         let p: AVAudioPlayer
         do { p = try AVAudioPlayer(data: d) } catch { log("provider audio decode failed: \(error.localizedDescription)"); return false }
         p.delegate = self
         guard p.prepareToPlay(), p.play() else { log("provider playback start failed"); return false }
-        // card C: the WAV is already in RAM — parse once and let the frame ticker ride
-        // the playhead (player.currentTime). No re-decode, no disk (§9).
-        let (pcm, rate) = Self.pcm16(fromWAV: d)
-        setState { player = p; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
+        setState { legacy = p; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
         outFlip(true, "provider")
         firstAudio("provider")
-        log("provider playback started: dur=\(String(format: "%.1f", p.duration))s wf=\(pcm.count)@\((Int(rate)))Hz")
+        log("provider playback started (legacy): dur=\(String(format: "%.1f", p.duration))s wf=\(pcm.count)@\((Int(rate)))Hz")
         return true
     }
     func ackTTS() {
@@ -632,7 +681,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // mouths are silent with an empty queue while audio is IN FLIGHT. The turn state
         // (idle) is the only sound "nothing pending" signal; a lost delegate is recovered
         // by the pump (flips stuck-speaking → idle → speakNext → drain → this fires).
-        guard queued.isEmpty, ttsState == "idle", synthInFlight == 0, !speech.isSpeaking, !(player?.isPlaying ?? false) else { bblock.unlock(); return }
+        guard queued.isEmpty, ttsState == "idle", synthInFlight == 0, !speech.isSpeaking, !playerNode.isPlaying, !(legacy?.isPlaying ?? false) else { bblock.unlock(); return }
         ttsAcked = true; ttsConn = nil; ttsEOF = false; streamOpen = false
         let n = spoken; let md = lastMode
         let tN = turnN; let tBase = turnSpokenBase; let tStart = turnStart; let tMode = turnMode
@@ -655,9 +704,9 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
     func barge() {
         bblock.lock(); queued.removeAll(); ttsState = "idle"; uttGen += 1
-        let p = player; outPcm = []; outT0 = 0; bblock.unlock()
+        let p = player; let lg = legacy; outPcm = []; outT0 = 0; bblock.unlock()
         speech.stopSpeaking(at: .immediate)
-        p?.stop()
+        playerNode.stop(); p?.stop(); lg?.stop()
         unduckOrResume()  // barged mid-turn: the podcast we paused deserves its voice back
         outFlip(false, "")   // card C: the mouth went silent mid-turn
         log("barge-in — mouth cleared")
@@ -849,7 +898,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // heartbeat @2s + queue drain watchdog
         if pumpTick % 10 == 0 {
             publish("b-status", statusJSON())
-            bblock.lock(); let talking = speech.isSpeaking || (player?.isPlaying ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; bblock.unlock()
+            bblock.lock(); let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; bblock.unlock()
             if !talking && q && st != "idle" && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); unduckOrResume(); if eof { ackTTS() } }
             // NOT talking, queue non-empty, state stuck "speaking" (missed delegate): speakNext's
             // own guard would re-deny — flip the state FIRST, then advance. This was the wedge.
@@ -858,17 +907,17 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             // raced the alive-check in speakNext's bg block and killed the audio (T1e postmortem).
             if !talking && !q && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); speakNext() }
             // stuck synthesizer/player: deadline expired → force-stop BOTH mouths
-            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); player?.stop(); setState { player = nil }; outFlip(false, "") }
+            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); setState { player = nil; legacy = nil }; outFlip(false, "") }
             // dead client: stream flagged open, no bytes 30s → treat as EOF, don't strand the turn
             if open && !eof && stale { bblock.lock(); streamOpen = false; ttsEOF = true; if let tail = String(data: ttsBuf, encoding: .utf8) { pending += tail }; ttsBuf = Data(); let rest = pending; pending = ""; bblock.unlock(); if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { enqueue(rest) } else { ackTTS() } }
         }
         // provider playback completed but the AVAudioPlayer delegate never fired (it is
         // run-loop-affine and flaky off-main): poll it to death — currentTime at EOF
         // means the sentence is over; advance the queue exactly like didFinishPlaying.
-        bblock.lock(); let pd = player; bblock.unlock()
+        bblock.lock(); let pd = legacy; bblock.unlock()   // the NODE's completion handler is run-loop-proof; only LEGACY needs polling to death
         if let p = pd, !p.isPlaying, p.currentTime >= max(0.5, p.duration - 0.5) {
-            log("tts done (provider, polled)")
-            setState { if player === p { player = nil } }
+            log("tts done (provider, polled legacy)")
+            setState { if legacy === p { legacy = nil } }
             speakNext()
         }
     }
@@ -883,7 +932,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         return "{\"version\":\"\(SIDECAR_VERSION)\",\"build\":\"\(SIDECAR_BUILD)\",\"stt\":{\"state\":\"\(sttState)\",\"engine\":\"\(engineName)\",\"segs\":\(segsDone)},"
              + "\"tts\":{\"state\":\"\(ttsState)\",\"queued\":\(queued.count),\"spoken\":\(spoken),\"mode\":\(jsonStr(lastMode)),"
              + "\"provider\":{\"configured\":\(!pBase.isEmpty && !pModel.isEmpty),\"base\":\(jsonStr(pBase)),\"model\":\(jsonStr(pModel)),\"voice\":\(jsonStr(voiceOverride)),\"errs\":\(providerErrs)}},"
-             + "\"mic\":\"\(micOn ? "armed" : "muted")\"}"
+             + "\"mic\":\"\(micOn ? "armed" : "muted")\",\"echoCancel\":\"\(canc.active ? "nlms-live" : "idle")\"}"
     }
 
     // ---- card C: return-channel frame ticker (b-in / b-out @20Hz + b-timing) ----
@@ -910,9 +959,9 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         }
         // b-out: envelope of the LEVEL-1 provider PCM riding the playhead. Between
         // sentences (queue advancing) isPlaying is false → frames pause, flip stays true.
-        bblock.lock(); let p = player; let pcm = outPcm; let orate = outRate; bblock.unlock()
-        guard let pl = p, pl.isPlaying, !pcm.isEmpty else { return }
-        let pos = min(Double(pcm.count), pl.currentTime * orate)
+        bblock.lock(); let p = player; let pcm = outPcm; let orate = outRate; let t0 = outT0; bblock.unlock()
+        guard let pl = p, pl.isPlaying, !pcm.isEmpty, orate > 0 else { return }
+        let pos = min(Double(pcm.count), max(0.0, CACurrentMediaTime() - t0) * orate)   // node has no currentTime — outT0 IS the playhead
         let win = min(Int(pos), Int(orate * 0.096))
         let (wf, rms) = Self.waveframe(pcm, Int(pos) - win, Int(pos))
         publish("b-out", "{\"ts\":\(Self.nowMs()),\"speaking\":true,\"mode\":\"provider\",\"level\":\(String(format: "%.4f", rms)),\"pos_ms\":\(Int(pos / orate * 1000)),\"waveform\":\"\(wf)\"}")
@@ -967,14 +1016,14 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) { log("tts cancel: \(utterance.speechString.prefix(40))"); speakNext() }
 
     // ---- AVAudioPlayerDelegate (LEVEL-1 provider playback) ----
-    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        log("tts done (provider\(flag ? "" : ", playback error"))")
-        setState { if self.player === player { self.player = nil } }
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {   // LEGACY path only
+        log("tts done (provider, legacy\(flag ? "" : ", playback error"))")
+        setState { if self.legacy === player { self.legacy = nil } }
         speakNext()
     }
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         log("provider playback decode error — advancing queue")
-        setState { if self.player === player { self.player = nil } }
+        setState { if self.legacy === player { self.legacy = nil } }
         speakNext()
     }
 }
