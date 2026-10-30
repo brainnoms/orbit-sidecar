@@ -287,9 +287,16 @@ log("initial tap spawns=\(enumerateTargets().count)")
 // the snapshot and clears the lease. Boot recovery: fresh heartbeat + live owner
 // ⇒ another instance is ducked (hands off); owner dead + snapshot ≤60s ⇒ restore;
 // stale snapshot ⇒ untrusted, lease left untouched, floor un-pinned only.
-let DUCK_FLOOR: Float32 = 0.12              // duck level == the pin signature
+// ⟦VOICE OWNS THE MIX LAW (Bob, 2026-10-30)⟧ the agent voice plays through the SAME master
+// the duck floors — a master pin drops music AND voice by the same amount, so the duck is
+// worthless AND every utterance is born at 12%. Three honest modes now: NOTHING PLAYING → no
+// duck at all (voice owns a full master — "lock the front door" is no longer a whisper);
+// Music/Spotify → APP-level duck (independent volume channel, master never moves); any other
+// source → master duck, floor raised to where the floored voice stays intelligible.
+let DUCK_FLOOR: Float32 = 0.30              // master-mode duck level == the pin signature
 let DUCK_FLOOR_EPS: Float32 = 0.005
 let DUCK_UNPIN_TO: Float32 = 0.5            // ONLY for stale-lease floor recovery
+let DUCK_APP_VOL: Int = 15                  // app-mode duck target (Music/Spotify own their volume)
 let DUCK_SNAP_MAX_AGE: TimeInterval = 60    // snapshot trusted for restore within this
 let DUCK_LEASE_LIVE: TimeInterval = 5       // heartbeat younger than this ⇒ owner alive
 let DUCK_DIR  = NSString(string: "~/.hermes/jarvis/orbit-duck").expandingTildeInPath
@@ -327,28 +334,57 @@ func restoreFromSnapshot(_ snap: [String: Any]) {
     }
 }
 func clearDuckState() { try? FileManager.default.removeItem(atPath: DUCK_LEASE); try? FileManager.default.removeItem(atPath: DUCK_SNAP) }
+func mediaPlayingNow() -> (Bool, String) {   // 2s-fresh MediaRemote cache — right tool for duck policy
+    guard let d = try? JSONSerialization.jsonObject(with: Data(npCache.utf8)) as? [String: Any] else { return (false, "") }
+    return (((d["state"] as? String) ?? "") == "playing", npAppNow())
+}
+func appVolume(_ app: String, set: Bool, to: Int = -1) -> Int {  // the INDEPENDENT channel duck always needed
+    let verb = app == "Spotify"
+        ? (set ? "set player volume to \(to)" : "get player volume")
+        : (set ? "set sound volume to \(to)" : "get sound volume")
+    guard let out = runOA("tell application \"\(app)\" to \(verb)", 0.8) else { return -1 }
+    if set { return 0 }
+    return Int((Double(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1).rounded())
+}
 func duck() {
     duckQ.async {
         if ducked { return }                 // overlapping speech: FIRST snapshot stands
+        let (playing, app) = mediaPlayingNow()
+        if !playing { log("duck: nothing playing — voice owns the full master (no lease)"); return }
+        let cur = (app == "Music" || app == "Spotify") ? appVolume(app, set: false) : -1
+        if cur >= 0 {
+            ducked = true
+            duckStarted = Date().timeIntervalSince1970
+            writeJSONAtomic(DUCK_SNAP, "{\"mode\":\"app\",\"app\":\"\(app)\",\"vol\":\(cur),\"taken_at\":\(duckStarted)}")
+            writeJSONAtomic(DUCK_LEASE, "{\"pid\":\(getpid()),\"started_at\":\(duckStarted),\"heartbeat\":\(duckStarted)}")
+            appVolume(app, set: true, to: DUCK_APP_VOL)
+            log("duck: \(app) app-volume \(cur)→\(DUCK_APP_VOL) — master untouched, voice rides full level")
+            return
+        }
         ducked = true
         duckStarted = Date().timeIntervalSince1970
-        var els: [Int] = []; var chs: [String] = []
-        for el in [0, 1, 2] { let v = readVol(outDev, el); if v >= 0 { els.append(el); chs.append("\"\(el)\":\(v)") } }  // LIVE scalars, synchronous, per-channel — never cachedVol
+        var els: [(Int, Float32)] = []; var chs: [String] = []
+        for el in [0, 1, 2] { let v = readVol(outDev, el); if v >= 0 { els.append((el, v)); chs.append("\"\(el)\":\(v)") } }  // LIVE scalars, synchronous, per-channel — never cachedVol
         writeJSONAtomic(DUCK_SNAP, "{\"device\":\"\(getOutputUID())\",\"taken_at\":\(duckStarted),\"channels\":{\(chs.joined(separator: ","))}}")
         writeJSONAtomic(DUCK_LEASE, "{\"pid\":\(getpid()),\"started_at\":\(duckStarted),\"heartbeat\":\(duckStarted)}")
-        for el in els { writeVol(outDev, el, DUCK_FLOOR) }
+        for (el, v) in els where v > DUCK_FLOOR + DUCK_FLOOR_EPS { writeVol(outDev, el, DUCK_FLOOR) }  // never RAISE a quieter master
         cachedVol = DUCK_FLOOR
-        log("duck: snapshot{\(chs.joined(separator: ","))} lease@pid\(getpid())")
+        log("duck: master snapshot{\(chs.joined(separator: ","))} floor→\(DUCK_FLOOR) lease@pid\(getpid())")
     }
 }
 func unduck() {
     duckQ.async {
         guard ducked else { return }
         ducked = false
-        if let snap = readJSON(DUCK_SNAP) { restoreFromSnapshot(snap) }
+        if let snap = readJSON(DUCK_SNAP) {
+            if (snap["mode"] as? String) == "app", let app = snap["app"] as? String,
+               let vol = (snap["vol"] as? NSNumber)?.doubleValue {
+                appVolume(app, set: true, to: Int(vol.rounded()))
+                log("unduck: \(app) app-volume restored to \(Int(vol)) — master never moved")
+            } else { restoreFromSnapshot(snap); log("unduck: master restored from snapshot") }
+        }
         clearDuckState()
         cachedVol = max(0, readVol(outDev, 0))
-        log("unduck: restored from snapshot")
     }
 }
 func recoverDuckLease() {                    // runs FIRST on duckQ at boot — before any server/duck verb
@@ -359,6 +395,13 @@ func recoverDuckLease() {                    // runs FIRST on duckQ at boot — 
     let hb = (lease?["heartbeat"] as? NSNumber)?.doubleValue ?? 0
     if pid > 0, kill(pid, 0) == 0, hb > 0, now - hb < DUCK_LEASE_LIVE { log("duck-recovery: live lease owned by pid \(pid) — hands off"); return }
     if let snap = readJSON(DUCK_SNAP), let taken = (snap["taken_at"] as? NSNumber)?.doubleValue, now - taken <= DUCK_SNAP_MAX_AGE {
+        if (snap["mode"] as? String) == "app", let app = snap["app"] as? String,
+           let vol = (snap["vol"] as? NSNumber)?.doubleValue {
+            let back = appVolume(app, set: true, to: Int(vol.rounded()))
+            clearDuckState()
+            log("duck-recovery: app duck died mid-speech — \(app) \(back == 0 ? "restored to \(Int(vol))" : "not running, cleared")")
+            return
+        }
         restoreFromSnapshot(snap); clearDuckState()
         log("duck-recovery: prior instance died mid-duck — restored from fresh snapshot (age \(Int(now - taken))s)")
     } else {

@@ -563,7 +563,49 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         }
         return d
     }
-    func playAudio(_ d: Data) -> Bool {
+    // ⟦LOUDNESS LAW⟧ Provider streams arrive light (measured Kokoro 2026-10-30: peak −6.6 dBFS,
+    // RMS −22.1) — every dB of that is room-filling headroom left on the table. Normalize the
+    // in-RAM PCM to ~−1 dBFS peak, cap +11 dB, never cut, never clip: pure gain on bytes that
+    // are already in RAM (zero audio-graph change, §9 zero-disk intact). AVSpeech LEVEL-2 owns
+    // its own engine levels — untouched. With the app-level duck the master never moves, so
+    // this gain IS the voice; in master mode it reclaims exactly what the floor takes.
+    static func normalizeWav16(_ d: Data) -> Data {
+        guard d.count > 64, Array(d.prefix(4)) == Array("RIFF".utf8), Array(d[8..<12]) == Array("WAVE".utf8) else { return d }
+        var off = 12, dataOff = -1, dataLen = 0, bits = 0, isPCM = false
+        while off + 8 <= d.count {
+            let sz = Int(UInt32(d[off+4]) | UInt32(d[off+5]) << 8 | UInt32(d[off+6]) << 16 | UInt32(d[off+7]) << 24)
+            if Array(d[off..<off+4]) == Array("fmt ".utf8), off + 24 <= d.count {
+                isPCM = d[off+12] == 1 && d[off+13] == 0
+                bits = Int(d[off+22]) | Int(d[off+23]) << 8
+            } else if Array(d[off..<off+4]) == Array("data".utf8) {
+                dataOff = off + 8; dataLen = min(sz, d.count - dataOff)
+            }
+            if sz <= 0 || off + 8 + sz > d.count + 1 { break }
+            off += 8 + sz + (sz & 1)
+        }
+        guard isPCM, bits == 16, dataOff >= 0, dataLen >= 2 else { return d }
+        var peak = 1; var i = dataOff
+        while i + 1 < dataOff + dataLen {
+            let s = Int16(bitPattern: UInt16(d[i]) | (UInt16(d[i+1]) << 8))
+            if abs(Int(s)) > peak { peak = abs(Int(s)) }
+            i += 2
+        }
+        let gain = min(3.5, 29500.0 / Double(max(peak, 900)))
+        guard gain > 1.05 else { return d }
+        var out = d; i = dataOff
+        while i + 1 < dataOff + dataLen {
+            let s = Int16(bitPattern: UInt16(d[i]) | (UInt16(d[i+1]) << 8))
+            var v = Int((Double(s) * gain).rounded())
+            if v > 32767 { v = 32767 }; if v < -32768 { v = -32768 }
+            let u = UInt16(bitPattern: Int16(truncatingIfNeeded: v))
+            out[i] = UInt8(truncatingIfNeeded: u); out[i+1] = UInt8(truncatingIfNeeded: u >> 8)
+            i += 2
+        }
+        log("normalizeWav16: peak \(peak) gain ×\(String(format: "%.2f", gain))")
+        return out
+    }
+    func playAudio(_ raw: Data) -> Bool {
+        let d = Self.normalizeWav16(raw)
         log("playAudio: \(d.count) bytes, main-thread=\(Thread.isMainThread)")
         let p: AVAudioPlayer
         do { p = try AVAudioPlayer(data: d) } catch { log("provider audio decode failed: \(error.localizedDescription)"); return false }
