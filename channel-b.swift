@@ -646,7 +646,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
            let buf = AVAudioPCMBuffer(pcmFormat: af, frameCapacity: AVAudioFrameCount(pcm.count)) {
             buf.frameLength = AVAudioFrameCount(pcm.count)
             if let ch = buf.floatChannelData {
-                let scale = 1.0 / 32768.0
+                let scale: Float = 1.0 / 32768.0
                 for i in 0..<pcm.count { let v = Float(pcm[i]) * scale; ch[0][i] = v; ch[1][i] = v }
             }
             if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: nil); nodeAttached = true }
