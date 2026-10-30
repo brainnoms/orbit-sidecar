@@ -574,9 +574,11 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         var off = 12, dataOff = -1, dataLen = 0, bits = 0, isPCM = false
         while off + 8 <= d.count {
             let sz = Int(UInt32(d[off+4]) | UInt32(d[off+5]) << 8 | UInt32(d[off+6]) << 16 | UInt32(d[off+7]) << 24)
-            if Array(d[off..<off+4]) == Array("fmt ".utf8), off + 24 <= d.count {
-                isPCM = d[off+12] == 1 && d[off+13] == 0
+            if Array(d[off..<off+4]) == Array("fmt ".utf8), off + 26 <= d.count {
+                let tag = Int(d[off+12]) | Int(d[off+13]) << 8
                 bits = Int(d[off+22]) | Int(d[off+23]) << 8
+                if tag == 0xFFFE { isPCM = d[off+24] == 1 }        // extensible: SubFormat GUID LSB
+                else { isPCM = tag != 3 && tag != 0x0055 }          // float/MP3 aren't; oMLX writes 0x5DC0 (the SAMPLE RATE!) in the tag — proven 16-bit LE, AudioToolbox plays it
             } else if Array(d[off..<off+4]) == Array("data".utf8) {
                 dataOff = off + 8; dataLen = min(sz, d.count - dataOff)
             }

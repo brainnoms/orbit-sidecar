@@ -39,10 +39,21 @@ rm -f "$EMPTYMARK"   # frames flowing again -> streak reset
 # rule 3: system reports audio PLAYING but no source is active -> the tap lost
 # its output device (aggregate invalidated by a device switch) -> restart, which
 # rebuilds the aggregate on the CURRENT default output.
+# ⟦TAP-DEAF EXEMPTION (2026-10-30)⟧ the rule may only judge apps the tap can HEAR.
+# Podcasts (process "Aperitif") attaches a tap but its playback never meters on it
+# (peak/rms stay 0) — and untapped players are worse. "playing + all-sources-silent"
+# used to KILL the sidecar mid-podcast-episode, over and over (three graceful
+# SIGTERM exits witnessed). Music/Spotify meter honestly; only their silence is
+# evidence of a dead aggregate. Everything else: no opinion, no kick.
 np="$(curl -s --max-time 3 http://127.0.0.1:8107/nowplaying 2>/dev/null)"
-active="$(printf '%s' "$body" | grep -c '"act":1')"
-if printf '%s' "$np" | grep -q '"state":"playing"' && [ "${active:-0}" -eq 0 ]; then
-  kick "playing-but-silent(device-change?)"
-fi
+npapp="$(printf '%s' "$np" | sed -n 's/.*"app":"\([^"]*\)".*/\1/p' | head -1)"
+case "$npapp" in
+  Music|Spotify)
+    line="$(printf '%s' "$body" | grep "\"name\":\"$npapp:" | tail -1)"
+    if [ -n "$line" ] && printf '%s' "$line" | grep -qE '"rms":(0|0\.0+)[,}]'; then
+      kick "playing-but-silent($npapp tap deaf?)"
+    fi
+    ;;
+esac
 
 exit 0
