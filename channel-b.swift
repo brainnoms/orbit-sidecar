@@ -450,7 +450,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         bblock.lock()
         if ttsState == "speaking" { bblock.unlock(); return }
         guard !queued.isEmpty else {
-            ttsState = "idle"; let eof = ttsEOF; bblock.unlock(); unduck()
+            ttsState = "idle"; let eof = ttsEOF; bblock.unlock(); unduckOrResume()
             outFlip(false, "")   // card C: end-of-speech flip (agent.speaking → false)
             if eof { ackTTS() }   // last sentence just played → end the turn, close the request
             return
@@ -464,7 +464,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // synth budget ON TOP of the playback estimate
         uttDeadline = CACurrentMediaTime() + Double(s.count) * 0.19 + (base.isEmpty ? 0 : synthTimeout) + 5.0
         bblock.unlock()
-        duck()
+        duckOrPause()   // ⟦VOICE OWNS THE MIX⟧ policy layer: spoken content PAUSES, music ducks, silence stays silent
         bblock.lock(); spoken += 1; bblock.unlock()
         if !base.isEmpty, !model.isEmpty {
             // LEVEL 1 (§1): synthesize with the CONFIGURED provider voice, play the
@@ -656,7 +656,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         let p = player; outPcm = []; outT0 = 0; bblock.unlock()
         speech.stopSpeaking(at: .immediate)
         p?.stop()
-        unduck()
+        unduckOrResume()  // barged mid-turn: the podcast we paused deserves its voice back
         outFlip(false, "")   // card C: the mouth went silent mid-turn
         log("barge-in — mouth cleared")
     }
@@ -848,7 +848,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         if pumpTick % 10 == 0 {
             publish("b-status", statusJSON())
             bblock.lock(); let talking = speech.isSpeaking || (player?.isPlaying ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; bblock.unlock()
-            if !talking && q && st != "idle" && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); unduck(); if eof { ackTTS() } }
+            if !talking && q && st != "idle" && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); unduckOrResume(); if eof { ackTTS() } }
             // NOT talking, queue non-empty, state stuck "speaking" (missed delegate): speakNext's
             // own guard would re-deny — flip the state FIRST, then advance. This was the wedge.
             // Card B: synthInFlight > 0 means a provider sentence was DEQUEUED and is being
