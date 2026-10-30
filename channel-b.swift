@@ -92,7 +92,11 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     var legacy: AVAudioPlayer?       // fallback when the engine can't run — no cancellation, logged honestly
     var vpio = false                 // Voice Processing IO engaged (AEC + NS + AGC on the mic path)
     var vpioTried = false
-    var nodeAttached = false         // engine.attach is one-shot per node — twice = NSAssert death
+    var nodeAttached = false
+    // The player node speaks exactly ONE format (48k stereo). Provider audio is
+    // RESAMPLED into it in code: a 24k buffer scheduled into a 48k node doesn't
+    // error — it just plays at chipmunk speed (caught live 2026-10-30).
+    let nodeAF = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!         // engine.attach is one-shot per node — twice = NSAssert death
     var dumpDir = ProcessInfo.processInfo.environment["ORBIT_TTS_DUMP"] ?? ""   // evidence hook: dump provider bytes here ("off" unless env or /b/mode)
     var daemon: Process?
     var dIn: FileHandle?
@@ -642,14 +646,22 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // scheduleBuffer THROWS the channel-mismatch NSException (caught live 2026-10-30:
         // every provider sentence killed the process mid-syllable). Mono source fans to
         // both channels; the canceller still references the mono source — that's physics.
-        if pcm.count > 0, let af = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(rate), channels: 2, interleaved: false),
-           let buf = AVAudioPCMBuffer(pcmFormat: af, frameCapacity: AVAudioFrameCount(pcm.count)) {
-            buf.frameLength = AVAudioFrameCount(pcm.count)
+        let srOut = 48000.0
+        let nOut = max(1, Int((Double(pcm.count) * (srOut / Double(rate))).rounded()))
+        if pcm.count > 0, let buf = AVAudioPCMBuffer(pcmFormat: nodeAF, frameCapacity: AVAudioFrameCount(nOut)) {
+            buf.frameLength = AVAudioFrameCount(nOut)
             if let ch = buf.floatChannelData {
-                let scale: Float = 1.0 / 32768.0
-                for i in 0..<pcm.count { let v = Float(pcm[i]) * scale; ch[0][i] = v; ch[1][i] = v }
+                let ratio = Double(rate) / srOut          // source position per output frame
+                let inv = 1.0 / 32768.0
+                for i in 0..<nOut {
+                    let pos = Double(i) * ratio
+                    let i0 = Swift.min(pcm.count - 1, Int(pos)); let i1 = Swift.min(pcm.count - 1, i0 + 1)
+                    let f = Float(pos - Double(i0))
+                    let v = (Float(pcm[i0]) + (Float(pcm[i1]) - Float(pcm[i0])) * f) * inv
+                    ch[0][i] = v; ch[1][i] = v
+                }
             }
-            if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: nil); nodeAttached = true }
+            if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: nodeAF); nodeAttached = true }
             if !engine.isRunning {
                 engine.prepare()
                 do { try engine.start() } catch { log("playback engine start failed: \(error.localizedDescription) — legacy player, echo NOT cancelled") }
