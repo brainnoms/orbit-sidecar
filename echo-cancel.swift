@@ -19,8 +19,8 @@ private let EC_RATE = 16000.0     // reference timeline rate = the mic tap's own
 private let EC_N = Int(EC_RATE * 4)  // 4-second rings
 
 final class EchoCanceller {
-    private var w  = [Float](repeating: 0, count: NTAP)
-    private var xv = [Float](repeating: 0, count: NTAP)           // reference window, newest at [0]
+    private var w  = [Float](repeating: 0, count: EC_NTAP)
+    private var xv = [Float](repeating: 0, count: EC_NTAP)           // reference window, newest at [0]
     private var mix = [Float](repeating: 0, count: EC_N)             // writer 1: ioProc mixdown (all tapped apps)
     private var agt = [Float](repeating: 0, count: EC_N)             // writer 2: the agent's own exact PCM
     private var baseT: Double = 0                                 // wall time of ring sample 0 (shared clock)
@@ -34,7 +34,7 @@ final class EchoCanceller {
     var active: Bool { let t = CACurrentMediaTime(); return t - lastMix < 0.5 || t - lastAgt < 0.5 }
     func setDeviceRate(_ r: Double) {
         let s = min(8, max(1, Int((r / EC_RATE).rounded())))
-        if s != devStep { devStep = s; w = [Float](repeating: 0, count: NTAP) }
+        if s != devStep { devStep = s; w = [Float](repeating: 0, count: EC_NTAP) }
     }
 
     // ---- writer 1: every render quantum of the whole-output mixdown (ioProc) ----
@@ -66,7 +66,7 @@ final class EchoCanceller {
     // ---- writer 2: the agent's sentence, exact bytes, anchored to play start ----
     func pushRef(_ pcm: [Int16], fromRate: Double, at t: Double) {
         let ratio = fromRate / EC_RATE
-        let n = Swift.min(Int(Double(pcm.count) / ratio), N)
+        let n = Swift.min(Int(Double(pcm.count) / ratio), EC_N)
         if baseT == 0 { baseT = t - Double(mixWrite) / EC_RATE }
         let start = Int((t - baseT) * EC_RATE)
         for i in 0..<n {
