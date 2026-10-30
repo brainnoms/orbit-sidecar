@@ -638,10 +638,17 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         let d = Self.normalizeWav16(raw)
         log("playAudio: \(d.count) bytes, main-thread=\(Thread.isMainThread) echo=\(canc.active ? "nlms" : "idle")")
         let (pcm, rate) = Self.pcm16(fromWAV: d)
-        if pcm.count > 0, let af = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(rate), channels: 1, interleaved: true),
+        // SCHEDULE STEREO, THE ENGINE'S LANGUAGE: the output path renders stereo, and
+        // scheduleBuffer THROWS the channel-mismatch NSException (caught live 2026-10-30:
+        // every provider sentence killed the process mid-syllable). Mono source fans to
+        // both channels; the canceller still references the mono source — that's physics.
+        if pcm.count > 0, let af = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(rate), channels: 2, interleaved: false),
            let buf = AVAudioPCMBuffer(pcmFormat: af, frameCapacity: AVAudioFrameCount(pcm.count)) {
             buf.frameLength = AVAudioFrameCount(pcm.count)
-            if let ch = buf.int16ChannelData?[0] { pcm.withUnsafeBufferPointer { src in memcpy(ch, src.baseAddress!, src.count * MemoryLayout<Int16>.size) } }
+            if let ch = buf.floatChannelData {
+                let scale = 1.0 / 32768.0
+                for i in 0..<pcm.count { let v = Float(pcm[i]) * scale; ch[0][i] = v; ch[1][i] = v }
+            }
             if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: nil); nodeAttached = true }
             if !engine.isRunning {
                 engine.prepare()
