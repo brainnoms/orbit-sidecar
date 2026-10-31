@@ -86,6 +86,12 @@ final class EchoCanceller {
     // ---- the mic tap: subtract everything the speaker is generating, in place ----
     func process(_ s: inout [Int16], _ n: Int, at t: Double) {
         guard n > 0, baseT != 0 else { return }
+        guard active else { return }
+        // ⟦THE MIC IS THE MIC⟧ (Bob, 2026-10-30): nothing playing ⇒ nothing to cancel ⇒
+        // the input passes BIT-FOR-BIT, by early return — not by trusting the energy
+        // floor to save it. The gap that used to bite: the reference ring keeps the LAST
+        // loud mix for up to 4 s after the speaker falls silent, and an adaptive filter
+        // will subtract a phantom echo from a very real voice. No live reference — no touch.
         let base = Int((t - baseT) * EC_RATE) - 2 * Int(EC_RATE / 1000)   // 2ms early; the tail eats true latency
         var norm = 0.0
         for i in 0..<n { let fi = base + i; if fi >= 0 { let v = refAt(fi); norm += Double(v) * Double(v) } }
