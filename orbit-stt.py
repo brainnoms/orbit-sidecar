@@ -80,6 +80,11 @@ def main():
                 audio = audio[np.array(idx)]
             t1 = time.time()
             kw = {"language": lang, "fp16": fp16 == "true"} if fp16 != "auto" else {"language": lang}
+            # ⟦HOUSEHOLD ROSTER⟧ (2026-10-30): a human saying "Hey Donna" transcribes as
+            # "Hey Dala" without a decoder bias — wake nomatch kills the loop at the gate.
+            # initial_prompt seeds the names this house answers to + command vocabulary.
+            pr = os.environ.get("ORBIT_STT_PROMPT", "Hey Donna, hey Orbit, hey Jarvis, hey Neuromancer. What time is it? Turn the lamp to fifty percent. Lock the front door. What's the weather?")
+            if pr: kw["initial_prompt"] = pr
             res = model.transcribe(audio, **kw)
             emit({"seg": seg, "text": (res.get("text") or "").strip(),
                   "final": True, "took": round(time.time() - t1, 3)})
