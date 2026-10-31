@@ -101,6 +101,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // converter does the interpolating — my hand-rolled linear resample (24k→48k) bought
     // speed at the price of robot voice (Bob, 2026-10-30). Reconnect the node when — and
     // only when — a different provider rate shows up; the mixer SRCs properly.
+    var renderAlive: Double = 0   // last node completion — the render is consuming samples
     var nodeRate: Double = 0
     func nodeFormat(_ r: Double) -> AVAudioFormat { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: r, channels: 2, interleaved: false)! }         // engine.attach is one-shot per node — twice = NSAssert death
     var dumpDir = ProcessInfo.processInfo.environment["ORBIT_TTS_DUMP"] ?? ""   // evidence hook: dump provider bytes here ("off" unless env or /b/mode)
@@ -675,12 +676,15 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // drain after one provider sentence: advance the queue (same discipline as the
     // AVAudioPlayer delegate — generation-checked so a barge stays silent)
     func nodeDone(_ gen: Int) {
+        bblock.lock(); renderAlive = CACurrentMediaTime(); bblock.unlock()
         bblock.lock(); let alive = (ttsState == "speaking" && uttGen == gen); bblock.unlock()
         guard alive else { return }
         log("tts done (provider) — echo-cancel: \(canc.reportAndReset())")
         setState { if playerNode.isPlaying || player != nil { player = nil } }
         DispatchQueue.main.async { self.speakNext() }
     }
+    // ⟦RENDER RECEIPT⟧: play() claims, nodeDone proves — completion stamps the
+    // render clock, and the watchdog names a dead render out loud instead of glowing.
     func playAudio(_ raw: Data) -> Bool {
         let d = Self.normalizeWav16(raw)
         log("playAudio: \(d.count) bytes, main-thread=\(Thread.isMainThread) echo=\(canc.active ? "nlms" : "idle")")
@@ -699,9 +703,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             // WIRE BEFORE DRIVE: attach + connect happen while the engine is stopped —
             // starting FIRST is what crashed every spoken answer (player play() on a node
             // connected after the graph froze). Start only AFTER the player is connected.
-            var earWas = false
             if !nodeAttached {
-                if engine.isRunning { engine.stop(); earWas = micOn }   // unfreeze the graph, honest restart
+                // CONNECT LIVE (2026-10-30): attaching to a stopped engine then stop/start
+                // 'unfroze' the graph for the disconnected-crash but put the OUTPUT render
+                // to sleep — lamp lit, spoken 0, no completion, silent forever (Bob watched
+                // the lie glow). connect() on a RUNNING engine patches the graph live; the
+                // ear's tap keeps the render tree honest. No stop ritual, no re-arm dance.
                 engine.attach(playerNode)
                 engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF)
                 nodeAttached = true; nodeRate = Double(rate)
@@ -714,12 +721,6 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             if !engine.isRunning {
                 engine.prepare()
                 do { try engine.start() } catch { log("playback engine start failed: \(error.localizedDescription) — legacy player, echo NOT cancelled") }
-                if earWas && engine.isRunning {
-                    // the rewiring stopped the engine the ear was riding — re-plant the tap
-                    // honestly (micOn=false first so armMic's claim doesn't short-circuit).
-                    bblock.lock(); micOn = false; bblock.unlock(); armMic()
-                    log("playback rewiring re-armed the ear")
-                }
             }
             if engine.isRunning {
                 bblock.lock(); let gen = uttGen; bblock.unlock()
