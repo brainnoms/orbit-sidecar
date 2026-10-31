@@ -713,21 +713,22 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             // WIRE BEFORE DRIVE: attach + connect happen while the engine is stopped —
             // starting FIRST is what crashed every spoken answer (player play() on a node
             // connected after the graph froze). Start only AFTER the player is connected.
+            var reArmEar = false
             if !nodeAttached {
-                // ⟦THE REAL AVAudioEngine LAW⟧ (crash SURVIVED two 'fixes' 2026-10-30):
-                // attach() on a STOPPED engine leaves the node UNconnected — our explicit
-                // connect() then works, and play() is legal. attach() on a RUNNING engine
-                // auto-connects the node to the mixer in a DISCONNECTED state — and the
-                // explicit connect() that follows is SILENTLY IGNORED. play() on that node
-                // throws 'player started when in a disconnected state' — every utterance,
-                // forever, both lamps glowing over a corpse. The fix is neither stop-ritual
-                // nor blind live-connect: DETACH then ATTACH. attach() after detach() on a
-                // running engine lands clean and connected; play() never lies again.
-                engine.detach(playerNode)                 // no-op before first attach
+                // ⟦THE ACTUAL LAW, LEARNED THE EXPENSIVE WAY⟧ (three 'fixes' died in the
+                // SAME exception tonight): the safe moment to change an AVAudioEngine node
+                // graph is when the engine is STOPPED. attach-vs-running games (live
+                // connect, detach-clean) all left the node disconnected-in-fact, and
+                // play() threw 'player started when in a disconnected state' every time.
+                // So: STOP the engine, wire the node while nothing renders, RESTART the
+                // engine — always, never short-circuited — and re-arm the ear's tap on the
+                // same honest path. Slower by milliseconds, silent by zero.
+                if engine.isRunning { engine.stop(); reArmEar = micOn }
+                engine.detach(playerNode)
                 engine.attach(playerNode)
                 engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF)
                 nodeAttached = true; nodeRate = Double(rate)
-                log("playback node attached via detach-clean")
+                log("playback graph rewired while stopped")
             }
             else if nodeRate != Double(rate) {
                 playerNode.stop(); engine.detach(playerNode); engine.attach(playerNode)
@@ -737,6 +738,10 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             if !engine.isRunning {
                 engine.prepare()
                 do { try engine.start() } catch { log("playback engine start failed: \(error.localizedDescription) — legacy player, echo NOT cancelled") }
+                if reArmEar && engine.isRunning {
+                    bblock.lock(); micOn = false; bblock.unlock(); armMic()
+                    log("rewire restarted the engine and re-armed the ear")
+                }
             }
             if engine.isRunning {
                 bblock.lock(); let gen = uttGen; bblock.unlock()
