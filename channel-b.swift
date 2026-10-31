@@ -51,7 +51,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // ---- state (all guarded by bblock) ----
     let bblock = NSLock()
     var sseConns: [NWConnection] = []
-    var evtId = 0
+    // evtId declared below, seeded from bootMark (cross-boot monotonic)
     var segId = 0
     var sttState = "starting"                  // starting|live|muted|down
     var engineName = "?"
