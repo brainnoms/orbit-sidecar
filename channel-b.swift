@@ -105,6 +105,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     func nodeFormat(_ r: Double) -> AVAudioFormat { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: r, channels: 2, interleaved: false)! }         // engine.attach is one-shot per node — twice = NSAssert death
     var dumpDir = ProcessInfo.processInfo.environment["ORBIT_TTS_DUMP"] ?? ""   // evidence hook: dump provider bytes here ("off" unless env or /b/mode)
     var daemon: Process?
+    // ⟦BOOT MARK⟧ (2026-10-30): b-stream replays events on (re)connect, so the plugin
+    // dedupes stt by monotonic id — but ids RESET to 1 when this process restarts, and a
+    // long-lived window saw every event from nine restarts tonight as 'older than seen'
+    // and silently ate them all: 'not a single stat'. b-hello now carries boot; a new
+    // boot resets the window's dedup ledger. State corrected live, at hello.
+    static let bootMark = Int(Date().timeIntervalSince1970 * 1000)
     var dIn: FileHandle?
     // ⟦PIPE LAW⟧ (2026-10-30): concurrent ~20 KB base64 JSON writes from global(qos:)
     // interleave mid-byte (pipe atomicity = 512 B) — whisper answered 'Incorrect
@@ -979,7 +985,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         return "{\"version\":\"\(SIDECAR_VERSION)\",\"build\":\"\(SIDECAR_BUILD)\",\"stt\":{\"state\":\"\(sttState)\",\"engine\":\"\(engineName)\",\"segs\":\(segsDone)},"
              + "\"tts\":{\"state\":\"\(ttsState)\",\"queued\":\(queued.count),\"spoken\":\(spoken),\"mode\":\(jsonStr(lastMode)),"
              + "\"provider\":{\"configured\":\(!pBase.isEmpty && !pModel.isEmpty),\"base\":\(jsonStr(pBase)),\"model\":\(jsonStr(pModel)),\"voice\":\(jsonStr(voiceOverride)),\"errs\":\(providerErrs)}},"
-             + "\"mic\":\"\(micOn ? "armed" : "muted")\",\"echoCancel\":\"\(canc.active ? "nlms-live" : "idle")\"}"
+             + "\"boot\":\(ChannelB.bootMark),\"mic\":\"\(micOn ? "armed" : "muted")\",\"echoCancel\":\"\(canc.active ? "nlms-live" : "idle")\"}"
     }
 
     // ---- card C: return-channel frame ticker (b-in / b-out @20Hz + b-timing) ----
