@@ -105,6 +105,10 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     var dumpDir = ProcessInfo.processInfo.environment["ORBIT_TTS_DUMP"] ?? ""   // evidence hook: dump provider bytes here ("off" unless env or /b/mode)
     var daemon: Process?
     var dIn: FileHandle?
+    // ⟦PIPE LAW⟧ (2026-10-30): concurrent ~20 KB base64 JSON writes from global(qos:)
+    // interleave mid-byte (pipe atomicity = 512 B) — whisper answered 'Incorrect
+    // padding'. One serial queue owns every whisper stdin write.
+    let whisperQ = DispatchQueue(label: "orbit.whisper.stdin", qos: .userInitiated)
     var pumpTick = 0
 
     // ---- card C: return-channel state (waveform + timing telemetry) ----
@@ -233,7 +237,10 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             // and judge silence on the CANCELLED signal, so the agent never hears itself talk.
             canc.process(&s, k, at: CACurrentMediaTime())
             var cs = 0.0; for j in 0..<k { let v = Double(s[j]); cs += v * v }
-            self.vad(s, k, k > 0 ? (cs / Double(k)).squareRoot() : 0)
+            // UNITS LAW: vadThresh is FLOAT (-40 dBFS = 0.010) — the tap's samples are
+            // INT16 (the echo surgery moved this path). Compare apples: /32767. Without
+            // it every fan is 'voiced', every segment rides the 10.4 s ceiling (2026-10-30).
+            self.vad(s, k, k > 0 ? (cs / Double(k)).squareRoot() / 32767.0 : 0)
         }
         if !engine.isRunning { engine.prepare() }
         do { if !engine.isRunning { try engine.start() } } catch {
@@ -295,7 +302,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         var wav = Data(wavHeader(Int32(pcm16.count * 2), Int32(micRate)))
         pcm16.withUnsafeBytes { wav.append(contentsOf: $0) }
         let line = "{\"seg\":\(seg),\"wav\":\"\(wav.base64EncodedString())\"}\n"
-        DispatchQueue.global(qos: .userInitiated).async { h.write(Data(line.utf8)) }
+        whisperQ.async { h.write(Data(line.utf8)) }
     }
     func wavHeader(_ dataLen: Int32, _ rate: Int32) -> [UInt8] {
         func u32(_ v: Int32) -> [UInt8] { [UInt8(v & 0xff), UInt8((v >> 8) & 0xff), UInt8((v >> 16) & 0xff), UInt8((v >> 24) & 0xff)] }
