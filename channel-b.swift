@@ -714,19 +714,25 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             // starting FIRST is what crashed every spoken answer (player play() on a node
             // connected after the graph froze). Start only AFTER the player is connected.
             if !nodeAttached {
-                // CONNECT LIVE (2026-10-30): attaching to a stopped engine then stop/start
-                // 'unfroze' the graph for the disconnected-crash but put the OUTPUT render
-                // to sleep — lamp lit, spoken 0, no completion, silent forever (Bob watched
-                // the lie glow). connect() on a RUNNING engine patches the graph live; the
-                // ear's tap keeps the render tree honest. No stop ritual, no re-arm dance.
+                // ⟦THE REAL AVAudioEngine LAW⟧ (crash SURVIVED two 'fixes' 2026-10-30):
+                // attach() on a STOPPED engine leaves the node UNconnected — our explicit
+                // connect() then works, and play() is legal. attach() on a RUNNING engine
+                // auto-connects the node to the mixer in a DISCONNECTED state — and the
+                // explicit connect() that follows is SILENTLY IGNORED. play() on that node
+                // throws 'player started when in a disconnected state' — every utterance,
+                // forever, both lamps glowing over a corpse. The fix is neither stop-ritual
+                // nor blind live-connect: DETACH then ATTACH. attach() after detach() on a
+                // running engine lands clean and connected; play() never lies again.
+                engine.detach(playerNode)                 // no-op before first attach
                 engine.attach(playerNode)
                 engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF)
                 nodeAttached = true; nodeRate = Double(rate)
+                log("playback node attached via detach-clean")
             }
             else if nodeRate != Double(rate) {
-                playerNode.stop(); engine.disconnectNodeInput(playerNode)
+                playerNode.stop(); engine.detach(playerNode); engine.attach(playerNode)
                 engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF); nodeRate = Double(rate)
-                log("playback node reformat: \(Int(nodeRate))Hz stereo")
+                log("playback node reformat via detach: \(Int(nodeRate))Hz stereo")
             }
             if !engine.isRunning {
                 engine.prepare()
