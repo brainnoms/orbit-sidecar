@@ -101,6 +101,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // converter does the interpolating — my hand-rolled linear resample (24k→48k) bought
     // speed at the price of robot voice (Bob, 2026-10-30). Reconnect the node when — and
     // only when — a different provider rate shows up; the mixer SRCs properly.
+    var uttStart: Double = 0
     var renderAlive: Double = 0   // last node completion — the render is consuming samples
     var nodeRate: Double = 0
     func nodeFormat(_ r: Double) -> AVAudioFormat { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: r, channels: 2, interleaved: false)! }         // engine.attach is one-shot per node — twice = NSAssert death
@@ -509,13 +510,21 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     }
     func enqueue(_ s: String) {
         let c = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard c.count >= 2 else { return }
+        guard c.count >= 2 else { if !c.isEmpty { log("enqueue DROP <2ch: \"\(c)\"") }; return }
         bblock.lock(); queued.append(c); bblock.unlock()
         speakNext()
     }
     func speakNext() {
         bblock.lock()
-        if ttsState == "speaking" { bblock.unlock(); return }
+        if ttsState == "speaking" {
+            // a queue waiting behind a 'speaking' that never ends = the wedge we keep
+            // finding blind (2026-10-30). Name it: queued depth + how long it's held.
+            if !queued.isEmpty {
+                let held = CACurrentMediaTime() - uttStart
+                if held > 3 { log("speakNext DENY: state=speaking held \(String(format: "%.1f", held))s queued=\(queued.count)") }
+            }
+            bblock.unlock(); return
+        }
         guard !queued.isEmpty else {
             ttsState = "idle"; let eof = ttsEOF; bblock.unlock(); unduckOrResume()
             outFlip(false, "")   // card C: end-of-speech flip (agent.speaking → false)
@@ -525,6 +534,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         let s = queued.removeFirst()
         ttsState = "speaking"
         uttGen += 1; let gen = uttGen
+        uttStart = CACurrentMediaTime()
         let v = voiceOverride
         let base = pBase, key = pKey, model = pModel
         // stuck-fuse: AVSpeech at rate 0.5 runs ~0.19s/char; provider mode gets the
@@ -799,6 +809,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             } else { text = body }
         }
         httpResp(conn, "202 Accepted", "application/json", "{\"queued\":true}")
+        log("oneShot: \"\(String(text.prefix(40)))\" base=\(pBase.isEmpty ? "UNSET" : "set") model=\(pModel.isEmpty ? "unset" : pModel)")
         enqueue(text)
     }
     func mode(_ conn: NWConnection, _ req: String) {
