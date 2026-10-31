@@ -740,7 +740,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             if !engine.isRunning {
                 engine.prepare()
                 do { try engine.start() } catch { log("playback engine start failed: \(error.localizedDescription) — legacy player, echo NOT cancelled") }
-                if !engine.isRunning { log("engine refused to start: state=\(engine.state.rawValue) — falling to legacy DAC path") }
+                if !engine.isRunning { log("engine refused to start (isRunning=false after start attempt) — falling to legacy DAC path") }
                 if reArmEar && engine.isRunning {
                     bblock.lock(); micOn = false; bblock.unlock(); armMic()
                     log("rewire restarted the engine and re-armed the ear")
