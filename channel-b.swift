@@ -696,7 +696,16 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 for i in 0..<pcm.count { let v = Float(pcm[i]) * scale; ch[0][i] = v; ch[1][i] = v }
             }
             let wantAF = nodeFormat(Double(rate))
-            if !nodeAttached { engine.attach(playerNode); engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF); nodeAttached = true; nodeRate = Double(rate) }
+            // WIRE BEFORE DRIVE: attach + connect happen while the engine is stopped —
+            // starting FIRST is what crashed every spoken answer (player play() on a node
+            // connected after the graph froze). Start only AFTER the player is connected.
+            var earWas = false
+            if !nodeAttached {
+                if engine.isRunning { engine.stop(); earWas = micOn }   // unfreeze the graph, honest restart
+                engine.attach(playerNode)
+                engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF)
+                nodeAttached = true; nodeRate = Double(rate)
+            }
             else if nodeRate != Double(rate) {
                 playerNode.stop(); engine.disconnectNodeInput(playerNode)
                 engine.connect(playerNode, to: engine.mainMixerNode, format: wantAF); nodeRate = Double(rate)
@@ -705,6 +714,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             if !engine.isRunning {
                 engine.prepare()
                 do { try engine.start() } catch { log("playback engine start failed: \(error.localizedDescription) — legacy player, echo NOT cancelled") }
+                if earWas && engine.isRunning {
+                    // the rewiring stopped the engine the ear was riding — re-plant the tap
+                    // honestly (micOn=false first so armMic's claim doesn't short-circuit).
+                    bblock.lock(); micOn = false; bblock.unlock(); armMic()
+                    log("playback rewiring re-armed the ear")
+                }
             }
             if engine.isRunning {
                 bblock.lock(); let gen = uttGen; bblock.unlock()
@@ -965,6 +980,11 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             // cooked right now — both mouths silent, queue empty, NOT a wedge. Flipping here
             // raced the alive-check in speakNext's bg block and killed the audio (T1e postmortem).
             if !talking && !q && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); speakNext() }
+            // ⟦GRAPH FROZEN AT START⟧ (three crashes 2026-10-3x: 'player started when in a
+            // disconnected state'): once the engine has run, the node graph is frozen —
+            // an engine STOP (config-change ear release, disarm-while-idle) invalidates our
+            // 'attached' claim. Track aliveness; a stopped engine means re-attach next play.
+            if nodeAttached && !engine.isRunning { nodeAttached = false }
             // stuck synthesizer/player: deadline expired → force-stop BOTH mouths
             if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); setState { player = nil; legacy = nil }; outFlip(false, "") }
             // dead client: stream flagged open, no bytes 30s → treat as EOF, don't strand the turn
