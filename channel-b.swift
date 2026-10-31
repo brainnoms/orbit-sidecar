@@ -111,6 +111,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // and silently ate them all: 'not a single stat'. b-hello now carries boot; a new
     // boot resets the window's dedup ledger. State corrected live, at hello.
     static let bootMark = Int(Date().timeIntervalSince1970 * 1000)
+    // ⟦CROSS-BOOT IDS⟧ (2026-10-30, 'still the same'): event ids restarted at 1 every
+    // boot, so a long-lived window deduped a REAL wake phrase to death (id=2935 beat the
+    // fresh ids). Event ids now inherit the birthmark: bootMark + counter is monotonic
+    // ACROSS reboots — the ledger never needs to know a reboot happened, and replay
+    // dedup inside one boot stands untouched. No disk, no lease, no zombie.
+    var evtId = ChannelB.bootMark
     var dIn: FileHandle?
     // ⟦PIPE LAW⟧ (2026-10-30): concurrent ~20 KB base64 JSON writes from global(qos:)
     // interleave mid-byte (pipe atomicity = 512 B) — whisper answered 'Incorrect
