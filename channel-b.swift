@@ -705,6 +705,23 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // scheduleBuffer THROWS the channel-mismatch NSException (caught live 2026-10-30:
         // every provider sentence killed the process mid-syllable). Mono source fans to
         // both channels; the canceller still references the mono source — that's physics.
+        // ⟦THE DAC IS THE MOUTH⟧ (2026-10-31, end of the long night): every engine-node
+        // attempt tonight — live-connect, detach-clean, stop-wire-restart — ended the same
+        // way: silent false or an abort inside engine calls, on the very thread that owns
+        // the ear's tap, with the tap world half-alive around it. Meanwhile AVAudioPlayer
+        // decoded the SAME WAV and PLAYED it on every corpse of this process, at native
+        // rate now that the WAV's own header carries the sample rate. So the proven path
+        // speaks first; the echo-cancelled node graph is an upgrade we only promote to
+        // when it is healthy, from a background queue, never again from main.
+        {
+            if let p = (try? AVAudioPlayer(data: d)) ?? nil, p.prepareToPlay(), p.play() {
+                setState { legacy = p; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
+                outFlip(true, "provider")
+                firstAudio("provider")
+                log("provider playback via DAC player: dur=\(String(format: "%.1f", p.duration))s @\(Int(rate))Hz")
+                return true
+            }
+        }
         if pcm.count > 0, let buf = AVAudioPCMBuffer(pcmFormat: nodeFormat(Double(rate)), frameCapacity: AVAudioFrameCount(pcm.count)) {
             buf.frameLength = AVAudioFrameCount(pcm.count)
             if let ch = buf.floatChannelData {
@@ -768,6 +785,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             }
         }
         // legacy path (engine unavailable) — audible but echo uncancelled, said out loud above
+        // ⟦THE MOUTH SHALL NOT BE AVSPEECH WHEN WAV EXISTS⟧ (2026-10-30, 00:30): the
+        // engine-node graph needs the input-side tap world alive to render; a daemon whose
+        // engine refuses to start used to fall to AVSpeech — a second voice, a second set
+        // of failure modes, and a silent speaker that still glowed. AVAudioPlayer needs
+        // NONE of it: HAL writes, no graph, no tap — it played at chipmunk speed while the
+        // engine was comatose. So when the engine is down, the WAV itself is the mouth.
         let p: AVAudioPlayer
         do { p = try AVAudioPlayer(data: d) } catch { log("provider audio decode failed: \(error.localizedDescription)"); return false }
         p.delegate = self
