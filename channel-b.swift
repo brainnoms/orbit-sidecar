@@ -649,13 +649,20 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // its own engine levels — untouched. With the app-level duck the master never moves, so
     // this gain IS the voice; in master mode it reclaims exactly what the floor takes.
     static func normalizeWav16(_ d: Data) -> Data {
+        // ⟦REPAIR, DON'T JUST READ⟧ (2026-10-31, the last bone in the night): we KNEW
+        // oMLX writes the sample rate into wFormatTag (0x5DC0 = 24000, a field lie),
+        // and we forgave the lie for OUR parser — then handed the still-broken header
+        // to AVAudioPlayer, whose decoder checks the tag, throws, and — behind a try? —
+        // dies without a sound. Leniency that never fixes the bytes is just failure
+        // scheduled later. The output of this function must be a VALID WAV, always.
         guard d.count > 64, Array(d.prefix(4)) == Array("RIFF".utf8), Array(d[8..<12]) == Array("WAVE".utf8) else { return d }
-        var off = 12, dataOff = -1, dataLen = 0, bits = 0, isPCM = false
+        var off = 12, dataOff = -1, dataLen = 0, bits = 0, isPCM = false, fmtOff = -1
         while off + 8 <= d.count {
             let sz = Int(UInt32(d[off+4]) | UInt32(d[off+5]) << 8 | UInt32(d[off+6]) << 16 | UInt32(d[off+7]) << 24)
             if Array(d[off..<off+4]) == Array("fmt ".utf8), off + 26 <= d.count {
                 let tag = Int(d[off+12]) | Int(d[off+13]) << 8
                 bits = Int(d[off+22]) | Int(d[off+23]) << 8
+                if tag != 1 { fmtOff = off }                     // the tag lies; remember where
                 if tag == 0xFFFE { isPCM = d[off+24] == 1 }        // extensible: SubFormat GUID LSB
                 else { isPCM = tag != 3 && tag != 0x0055 }          // float/MP3 aren't; oMLX writes 0x5DC0 (the SAMPLE RATE!) in the tag — proven 16-bit LE, AudioToolbox plays it
             } else if Array(d[off..<off+4]) == Array("data".utf8) {
@@ -665,6 +672,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             off += 8 + sz + (sz & 1)
         }
         guard isPCM, bits == 16, dataOff >= 0, dataLen >= 2 else { return d }
+        var out = d
+        if fmtOff >= 0 {
+            out[fmtOff+12] = 1; out[fmtOff+13] = 0                // wFormatTag := 1 — PCM, the truth
+            if fmtOff + 24 <= out.count && out[fmtOff+24] != 1 { out[fmtOff+24] = 1 }  // SubFormat GUID LSB too, if extensible
+            log("normalizeWav16: repaired bogus wFormatTag → PCM(1)")
+        }
         var peak = 1; var i = dataOff
         while i + 1 < dataOff + dataLen {
             let s = Int16(bitPattern: UInt16(d[i]) | (UInt16(d[i+1]) << 8))
@@ -672,8 +685,8 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             i += 2
         }
         let gain = min(3.5, 29500.0 / Double(max(peak, 900)))
-        guard gain > 1.05 else { return d }
-        var out = d; i = dataOff
+        guard gain > 1.05 else { return out }
+        i = dataOff
         while i + 1 < dataOff + dataLen {
             let s = Int16(bitPattern: UInt16(d[i]) | (UInt16(d[i+1]) << 8))
             var v = Int((Double(s) * gain).rounded())
@@ -713,8 +726,11 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // rate now that the WAV's own header carries the sample rate. So the proven path
         // speaks first; the echo-cancelled node graph is an upgrade we only promote to
         // when it is healthy, from a background queue, never again from main.
-        {
-            if let p = (try? AVAudioPlayer(data: d)) ?? nil, p.prepareToPlay(), p.play() {
+        if true {                                        // named block: Swift binds bare `}{` as glue
+            var p: AVAudioPlayer? = nil
+            do { p = try AVAudioPlayer(data: d) }
+            catch { log("DAC decode threw: \(error) — WAV fmt tag 0x\(String(format: "%04X", d.count>10 ? Int(d[2]) | Int(d[3])<<8 : 0))") }
+            if let p = p, p.prepareToPlay(), p.play() {
                 setState { legacy = p; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
                 outFlip(true, "provider")
                 firstAudio("provider")
