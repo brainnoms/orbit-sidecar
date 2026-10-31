@@ -227,7 +227,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 object: engine, queue: .main) { [weak self] _ in
                 guard let self = self else { return }
                 self.bblock.lock(); let was = self.micOn; self.micOn = false; self.bblock.unlock()
-                if was { self.setState { self.sttState = "reconfig" }; self.log("audio device changed — ear released, awaiting knock") }
+                if was { self.setState { self.sttState = "reconfig" }; log("audio device changed — ear released, awaiting knock") }
             }
         }
         let input = engine.inputNode
