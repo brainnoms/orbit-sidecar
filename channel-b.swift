@@ -204,6 +204,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             let took = (j["took"] as? Double) ?? 0
             let eng = getEngineName()
             setState { self.segsDone += 1 }
+            log("stt seg \(seg) result in \(String(format: "%.2f", took))s: \(jsonStr(String(text.prefix(80))))")  // success leaves a receipt
             publish("stt", "{\"id\":\(nextId()),\"seg\":\(seg),\"text\":\(jsonStr(text)),\"final\":true,\"engine\":\(jsonStr(eng)),\"took\":\(took),\"ts\":\(Int(Date().timeIntervalSince1970*1000))}")
             // barge-in: a fresh utterance heard while speaking kills the mouth (§5.1)
             if bargeOn { bblock.lock(); let talking = ttsState == "speaking"; bblock.unlock()
