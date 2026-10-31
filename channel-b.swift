@@ -102,6 +102,8 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // speed at the price of robot voice (Bob, 2026-10-30). Reconnect the node when — and
     // only when — a different provider rate shows up; the mixer SRCs properly.
     var uttStart: Double = 0
+    var nodeEnds: Double = 0          // wall-clock finish line for the current node utterance
+    var nodeEnded: Bool { nodeEnds > 0 && CACurrentMediaTime() > nodeEnds }
     var renderAlive: Double = 0   // last node completion — the render is consuming samples
     var nodeRate: Double = 0
     func nodeFormat(_ r: Double) -> AVAudioFormat { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: r, channels: 2, interleaved: false)! }         // engine.attach is one-shot per node — twice = NSAssert death
@@ -746,8 +748,16 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             if engine.isRunning {
                 bblock.lock(); let gen = uttGen; bblock.unlock()
                 playerNode.stop()
+                // ⟦THE WALL-CLOCK TRUTH⟧ (2026-10-30): the engine renders — the ear's tap
+                // proves it every second — but playerNode's completion callback NEVER FIRES
+                // on this aggregate: tts done stayed silent, the mouth stayed 'speaking',
+                // the speaker lamp burned forever, and every next sentence queued behind a
+                // ghost. So we stop trusting the callback and trust the CLOCK: the buffer's
+                // duration is known, play() just started; the watchdog declares the sentence
+                // DONE when the clock says it is. Callback still wins if it ever shows up.
                 playerNode.scheduleBuffer(buf, at: nil, options: []) { [weak self] in self?.nodeDone(gen) }
                 playerNode.play()
+                setState { nodeEnds = CACurrentMediaTime() + Double(pcm.count) / Double(rate) + 0.35 }
                 canc.pushRef(pcm, fromRate: Double(rate), at: CACurrentMediaTime() + 0.015)  // echo ref: its OWN samples
                 setState { player = playerNode; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
                 outFlip(true, "provider")
@@ -1008,8 +1018,18 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             // an engine STOP (config-change ear release, disarm-while-idle) invalidates our
             // 'attached' claim. Track aliveness; a stopped engine means re-attach next play.
             if nodeAttached && !engine.isRunning { nodeAttached = false }
+            // ⟦CLOCK-COMPLETION⟧: node utterance past its known duration = done, callback
+            // or not — ttsState flips, queue drains, the lamp goes DARK. (The callback path
+            // still fires nodeDone when CoreAudio feels like it; the clock never sulks.)
+            if nodeEnds > 0 && playerNode.isPlaying && CACurrentMediaTime() > nodeEnds {
+                log("node utterance complete by wall clock")
+                playerNode.stop()
+                nodeEnds = 0
+                let doneGen = uttGen
+                nodeDone(doneGen)
+            }
             // stuck synthesizer/player: deadline expired → force-stop BOTH mouths
-            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); setState { player = nil; legacy = nil }; outFlip(false, "") }
+            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); setState { player = nil; legacy = nil; nodeEnds = 0 }; outFlip(false, "") }
             // dead client: stream flagged open, no bytes 30s → treat as EOF, don't strand the turn
             if open && !eof && stale { bblock.lock(); streamOpen = false; ttsEOF = true; if let tail = String(data: ttsBuf, encoding: .utf8) { pending += tail }; ttsBuf = Data(); let rest = pending; pending = ""; bblock.unlock(); if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { enqueue(rest) } else { ackTTS() } }
         }
