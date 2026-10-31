@@ -92,6 +92,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     var legacy: AVAudioPlayer?       // fallback when the engine can't run — no cancellation, logged honestly
     var vpio = false                 // Voice Processing IO engaged (AEC + NS + AGC on the mic path)
     var vpioTried = false
+    var cfgObs = false
     var nodeAttached = false
     // The player node speaks exactly ONE format (48k stereo). Provider audio is
     // RESAMPLED into it in code: a 24k buffer scheduled into a 48k node doesn't
@@ -212,7 +213,23 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
 
     // ---------------- mic tap + VAD (RAM only — §9 zero-disk) ----------------
     func armMic() {
-        bblock.lock(); if micOn { bblock.unlock(); return }; bblock.unlock()
+        // ⟦ATOMIC CLAIM⟧ (crash 22:30:44: 'nullptr == Tap()' NSException): the guard used
+        // to CHECK micOn and release the lock, setting it true only after the setup
+        // gauntlet. Two plugin windows knocked on the same envelope tick, BOTH walked in,
+        // BOTH installTapped bus 0 — CoreAudio kills the process for a double tap. The
+        // ticket is now TAKEN UNDER THE LOCK; the loser returns, the winner arms.
+        bblock.lock(); if micOn { bblock.unlock(); return }; micOn = true; bblock.unlock()
+        if !cfgObs { cfgObs = true
+            // ⟦CONFIG-CHANGE REFLEX⟧ a device swap resets the input node — tap gone, engine
+            // stopped, but our books said armed. Release the claim so the plugin's steady
+            // knock re-arms the real ear within seconds: live-state correction, not a corpse.
+            NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                object: engine, queue: .main) { [weak self] _ in
+                guard let self = self else { return }
+                self.bblock.lock(); let was = self.micOn; self.micOn = false; self.bblock.unlock()
+                if was { self.setState { self.sttState = "reconfig" }; self.log("audio device changed — ear released, awaiting knock") }
+            }
+        }
         let input = engine.inputNode
         // ⟦THE MIC SHALL NOT HEAR THE SPEAKER⟧ no vendor AEC, no opinions: echo-cancel.swift
         // subtracts the WHOLE output from the mic with our own NLMS — the exact samples the
@@ -221,6 +238,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         let step = max(1, Int(fmt.sampleRate / 16000.0))
         micRate = (fmt.sampleRate / Double(step)).rounded()
         let chN = max(1, Int(fmt.channelCount))
+        input.removeTap(onBus: 0)   // belt: one tap per bus, remove first, plant once
         input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
             guard let self = self, let ch = buf.floatChannelData else { return }
             let n = Int(buf.frameLength)
