@@ -736,10 +736,10 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 pr.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
                 pr.arguments = [path]
                 bblock.lock(); let gen = uttGen; bblock.unlock()
-                pr.terminationHandler = { p2 in
+                pr.terminationHandler = { [weak self] p2 in
                     try? FileManager.default.removeItem(atPath: path)
                     log("afplay mouth exited status=\(p2.terminationStatus)")
-                    if p2.terminationStatus == 0 { nodeDone(gen) }   // on-time exit IS completion
+                    if p2.terminationStatus == 0 { self?.nodeDone(gen) }   // on-time exit IS completion
                 }
                 do {
                     try pr.run()
