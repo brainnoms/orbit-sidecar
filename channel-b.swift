@@ -736,10 +736,10 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 pr.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
                 pr.arguments = [path]
                 bblock.lock(); let gen = uttGen; bblock.unlock()
-                pr.terminationHandler = { [weak self] p2 in
+                pr.terminationHandler = { p2 in
                     try? FileManager.default.removeItem(atPath: path)
-                    self?.log("afplay mouth exited status=\(p2.terminationStatus)")
-                    if p2.terminationStatus == 0 { self?.nodeDone(gen) }   // on-time exit IS completion
+                    log("afplay mouth exited status=\(p2.terminationStatus)")
+                    if p2.terminationStatus == 0 { nodeDone(gen) }   // on-time exit IS completion
                 }
                 do {
                     try pr.run()
@@ -1096,7 +1096,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 nodeDone(doneGen)
             }
             // stuck synthesizer/player: deadline expired → force-stop BOTH mouths
-            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); setState { let ghost = afProc; afProc = nil; player = nil; legacy = nil; nodeEnds = 0 }; ghost?.terminate(); outFlip(false, "") }
+            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); let ghost = afProc; setState { afProc = nil; player = nil; legacy = nil; nodeEnds = 0 }; ghost?.terminate(); outFlip(false, "") }
             // dead client: stream flagged open, no bytes 30s → treat as EOF, don't strand the turn
             if open && !eof && stale { bblock.lock(); streamOpen = false; ttsEOF = true; if let tail = String(data: ttsBuf, encoding: .utf8) { pending += tail }; ttsBuf = Data(); let rest = pending; pending = ""; bblock.unlock(); if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { enqueue(rest) } else { ackTTS() } }
         }
