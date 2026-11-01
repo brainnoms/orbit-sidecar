@@ -102,6 +102,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     // speed at the price of robot voice (Bob, 2026-10-30). Reconnect the node when — and
     // only when — a different provider rate shows up; the mixer SRCs properly.
     var uttStart: Double = 0
+    var afProc: Process? = nil          // ⟦AFPLAY MOUTH⟧: both in-process players refused to open output ALL NIGHT while say/afplay/AVSpeech worked — sounding is DELEGATED to a child process whose on-time exit is the completion receipt.
     var nodeEnds: Double = 0          // wall-clock finish line for the current node utterance
     var nodeEnded: Bool { nodeEnds > 0 && CACurrentMediaTime() > nodeEnds }
     var renderAlive: Double = 0   // last node completion — the render is consuming samples
@@ -482,7 +483,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 // PROTOCOL end-of-turn — authoritative. TCP isComplete does NOT fire
                 // on keep-alive (curl) and may not fire at the chunk terminator either;
                 // the client says "final" when the turn's text is done. Ack + close.
-                bblock.lock(); ttsEOF = true; streamOpen = false; let qEmpty = queued.isEmpty; let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false); bblock.unlock()
+                bblock.lock(); ttsEOF = true; streamOpen = false; let qEmpty = queued.isEmpty; let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false) || (afProc?.isRunning ?? false); bblock.unlock()
                 if qEmpty && !talking { ackTTS() }   // else the delegate/pump acks when the queue drains
                 return
             }
@@ -727,15 +728,28 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // speaks first; the echo-cancelled node graph is an upgrade we only promote to
         // when it is healthy, from a background queue, never again from main.
         if true {                                        // named block: Swift binds bare `}{` as glue
-            var p: AVAudioPlayer? = nil
-            do { p = try AVAudioPlayer(data: d) }
-            catch { log("DAC decode threw: \(error) — WAV fmt tag 0x\(String(format: "%04X", d.count>10 ? Int(d[2]) | Int(d[3])<<8 : 0))") }
-            if let p = p, p.prepareToPlay(), p.play() {
-                setState { legacy = p; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
-                outFlip(true, "provider")
-                firstAudio("provider")
-                log("provider playback via DAC player: dur=\(String(format: "%.1f", p.duration))s @\(Int(rate))Hz")
-                return true
+            let path = "/tmp/.orbit_speak_\(getpid()).wav"
+            do { try d.write(to: URL(fileURLWithPath: path)) }
+            catch { log("afplay WAV write failed: \(error.localizedDescription)") }
+            if FileManager.default.fileExists(atPath: path) {
+                let pr = Process()
+                pr.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+                pr.arguments = [path]
+                bblock.lock(); let gen = uttGen; bblock.unlock()
+                pr.terminationHandler = { [weak self] p2 in
+                    try? FileManager.default.removeItem(atPath: path)
+                    self?.log("afplay mouth exited status=\(p2.terminationStatus)")
+                    if p2.terminationStatus == 0 { self?.nodeDone(gen) }   // on-time exit IS completion
+                }
+                do {
+                    try pr.run()
+                    setState { afProc = pr; outPcm = pcm; outRate = Double(rate); outT0 = CACurrentMediaTime() }
+                    canc.pushRef(pcm, fromRate: Double(rate), at: CACurrentMediaTime() + 0.05)  // echo ref: its OWN samples
+                    outFlip(true, "provider")
+                    firstAudio("provider")
+                    log("provider playback via afplay mouth: dur=\(String(format: "%.1f", Double(pcm.count) / Double(rate)))s @\(Int(rate))Hz")
+                    return true
+                } catch { log("afplay spawn failed: \(error.localizedDescription)") }
             }
         }
         if pcm.count > 0, let buf = AVAudioPCMBuffer(pcmFormat: nodeFormat(Double(rate)), frameCapacity: AVAudioFrameCount(pcm.count)) {
@@ -1045,7 +1059,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // heartbeat @2s + queue drain watchdog
         if pumpTick % 10 == 0 {
             publish("b-status", statusJSON())
-            bblock.lock(); let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; bblock.unlock()
+            bblock.lock(); let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false) || (afProc?.isRunning ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; bblock.unlock()
             if !talking && q && st != "idle" && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); unduckOrResume(); if eof { ackTTS() } }
             // ⟦THE LAMP SHALL NOT OUTLIVE ITS MOUTH⟧ (2026-10-31, 01:15, Bob: "the speaker
             // lamp is stuck lit"): a fallback was SCHEDULED, the audio world died before it
@@ -1082,7 +1096,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 nodeDone(doneGen)
             }
             // stuck synthesizer/player: deadline expired → force-stop BOTH mouths
-            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); setState { player = nil; legacy = nil; nodeEnds = 0 }; outFlip(false, "") }
+            if talking && uttDeadline > 0 && pastDeadline { log("tts stuck past deadline — force-stop"); speech.stopSpeaking(at: .immediate); playerNode.stop(); player?.stop(); legacy?.stop(); setState { let ghost = afProc; afProc = nil; player = nil; legacy = nil; nodeEnds = 0 }; ghost?.terminate(); outFlip(false, "") }
             // dead client: stream flagged open, no bytes 30s → treat as EOF, don't strand the turn
             if open && !eof && stale { bblock.lock(); streamOpen = false; ttsEOF = true; if let tail = String(data: ttsBuf, encoding: .utf8) { pending += tail }; ttsBuf = Data(); let rest = pending; pending = ""; bblock.unlock(); if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { enqueue(rest) } else { ackTTS() } }
         }
