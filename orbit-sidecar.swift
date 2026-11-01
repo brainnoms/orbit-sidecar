@@ -378,7 +378,14 @@ func restoreFromSnapshot(_ snap: [String: Any]) {
     guard let ch = snap["channels"] as? [String: Any] else { return }
     for (k, v) in ch {
         guard let el = Int(k), let lv = (v as? NSNumber)?.floatValue, lv >= 0 else { continue }
-        writeVol(dev, el, lv)
+        // ⟦A CRUSHED SNAPSHOT IS NOT A MEMORY⟧ (2026-10-31, 01:05): master was found at
+        // 0.0317 — AT OUR OWN FLOOR — and "restored" there sentence after sentence all
+        // night: every crash that died mid-duck let the heir snapshot a ducked world, and
+        // the faithful restore sealed the ratchet. A snapshot at/below floor level proves
+        // nothing about the room the user lived in — restore the FLOOR, never the corpse.
+        let fixed = lv < DUCK_FLOOR ? DUCK_FLOOR : lv
+        if fixed != lv { log("restore: snapshot \(String(format: "%.3f", lv)) is a crushed ghost — clamped to floor \(String(format: "%.3f", DUCK_FLOOR))") }
+        writeVol(dev, el, fixed)
     }
 }
 func clearDuckState() { try? FileManager.default.removeItem(atPath: DUCK_LEASE); try? FileManager.default.removeItem(atPath: DUCK_SNAP) }

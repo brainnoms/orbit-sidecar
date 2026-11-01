@@ -1047,6 +1047,19 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             publish("b-status", statusJSON())
             bblock.lock(); let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; bblock.unlock()
             if !talking && q && st != "idle" && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); unduckOrResume(); if eof { ackTTS() } }
+            // ⟦THE LAMP SHALL NOT OUTLIVE ITS MOUTH⟧ (2026-10-31, 01:15, Bob: "the speaker
+            // lamp is stuck lit"): a fallback was SCHEDULED, the audio world died before it
+            // spoke — isSpeaking false, node silent, legacy nil — and every idle rule was
+            // held hostage by a non-empty queue. A 'speaking' lamp with no mouth moving
+            // anywhere, past its generous deadline, with no synth in flight, is a LIE:
+            // extinguish it, drain to the next sentence, and say so out loud.
+            if !talking && st == "speaking" && pastDeadline && inflight == 0 {
+                log("speaking lamp orphaned — no mouth moved; extinguished, queue drains")
+                speech.stopSpeaking(at: .immediate); playerNode.stop()
+                bblock.lock(); ttsState = "idle"; uttDeadline = 0; nodeEnds = 0; bblock.unlock()
+                unduckOrResume(); outFlip(false, "")
+                DispatchQueue.main.async { self.speakNext() }
+            }
             // NOT talking, queue non-empty, state stuck "speaking" (missed delegate): speakNext's
             // own guard would re-deny — flip the state FIRST, then advance. This was the wedge.
             // Card B: synthInFlight > 0 means a provider sentence was DEQUEUED and is being
