@@ -747,7 +747,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                     canc.pushRef(pcm, fromRate: Double(rate), at: CACurrentMediaTime() + 0.05)  // echo ref: its OWN samples
                     outFlip(true, "provider")
                     firstAudio("provider")
-                    log("provider playback via afplay mouth: dur=\(String(format: "%.1f", Double(pcm.count) / Double(rate)))s @\(Int(rate))Hz")
+                    log("provider playback via afplay mouth: frames=\(pcm.count) @\(Int(rate))Hz")  // honest units — pcm is BYTES here; dur math waits for the morning patch
                     return true
                 } catch { log("afplay spawn failed: \(error.localizedDescription)") }
             }
