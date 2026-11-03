@@ -575,8 +575,14 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 self.providerErrs += 1; self.lastMode = "avspeech"
                 self.bblock.unlock()
                 done()
-                log("provider TTS unavailable — LEVEL-2 AVSpeech fallback (voice=\(v))")
-                self.fallbackSpeak(s, v)
+                // ⟦NO APPLE VOICE IN A TWO-BRAIN HOUSE⟧ (Bob's law 2026-10-31): when a
+                // provider IS configured but THIS sentence failed (401 wall, synth error),
+                // the mouth goes SILENT and BEACONS — an Apple robot wearing her face is
+                // worse than a quiet second. LEVEL-2 speaks only when no provider exists.
+                log("provider sentence failed — SILENT per Bob's law (no robot understudy); queue drains")
+                self.outFlip(false, "")                       // the lamp must not outlive a mouth that never spoke
+                self.unduckOrResume()
+                DispatchQueue.main.async { self.speakNext() }  // drain: one failed sentence must never wedge the queue
             }
         } else {
             // no provider/voice selection at all → LEVEL-2 OS default (§1: AVSpeech is last resort)
@@ -728,7 +734,9 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // speaks first; the echo-cancelled node graph is an upgrade we only promote to
         // when it is healthy, from a background queue, never again from main.
         if true {                                        // named block: Swift binds bare `}{` as glue
-            let path = "/tmp/.orbit_speak_\(getpid()).wav"
+            // unique per utterance: a late terminationHandler from sentence N must not
+            // yank sentence N+1's file out from under a live afplay (silent-short-play bug)
+            let path = "/tmp/.orbit_speak_\(getpid())_\(Int(Date().timeIntervalSince1970 * 1000)).wav"
             do { try d.write(to: URL(fileURLWithPath: path)) }
             catch { log("afplay WAV write failed: \(error.localizedDescription)") }
             if FileManager.default.fileExists(atPath: path) {
