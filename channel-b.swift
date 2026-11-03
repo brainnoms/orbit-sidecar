@@ -904,7 +904,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         }
         if let s = stt {
             engineMuted = !s
-            if s { armMic(); setState { sttState = "live" } }
+            if s { armMic(); setState { sttState = micOn ? "live" : "muted" } }   // report the ARM, not the ASK
             else { disarmMic(); setState { sttState = "muted" } }
         }
         httpResp(conn, "200 OK", "application/json", statusJSON())
@@ -961,7 +961,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         if let dd = args["dump"] as? String { setState { dumpDir = dd }; log("provider dump → \(dd.isEmpty ? "off" : dd)") }
         if let s = args["stt"] as? Bool {
             engineMuted = !s
-            if s { armMic(); setState { sttState = "live" } }
+            if s { armMic(); setState { sttState = micOn ? "live" : "muted" } }   // report the ARM, not the ASK
             else { disarmMic(); setState { sttState = "muted" } }
         }
         return (true, statusJSON())
