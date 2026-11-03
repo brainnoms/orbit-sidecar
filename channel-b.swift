@@ -581,7 +581,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
                 // worse than a quiet second. LEVEL-2 speaks only when no provider exists.
                 log("provider sentence failed — SILENT per Bob's law (no robot understudy); queue drains")
                 self.outFlip(false, "")                       // the lamp must not outlive a mouth that never spoke
-                self.unduckOrResume()
+                unduckOrResume()
                 DispatchQueue.main.async { self.speakNext() }  // drain: one failed sentence must never wedge the queue
             }
         } else {
