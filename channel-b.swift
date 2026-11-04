@@ -59,6 +59,8 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
     var micOn = false
     var engineMuted = false
     var ttsState = "idle"                      // idle|speaking
+    var windowMouth = false                    // ⟦WINDOW MOUTH⟧ the desktop window is sounding this turn (we keep the duck + the lamp truth, it keeps the audio)
+    var segSendTs: [Int: (Double, Double)] = [:]  // seg → (media-clock send ms, audio duration s) — STT receipt accounting
     var queued: [String] = []                  // speak queue (sentences)
     var spoken = 0
     var pending = ""                           // TTS token buffer (line-framed JSONL or raw)
@@ -221,11 +223,22 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             let took = (j["took"] as? Double) ?? 0
             let eng = getEngineName()
             setState { self.segsDone += 1 }
-            log("stt seg \(seg) result in \(String(format: "%.2f", took))s: \(jsonStr(String(text.prefix(80))))")  // success leaves a receipt
-            publish("stt", "{\"id\":\(nextId()),\"seg\":\(seg),\"text\":\(jsonStr(text)),\"final\":true,\"engine\":\(jsonStr(eng)),\"took\":\(took),\"ts\":\(Int(Date().timeIntervalSince1970*1000))}")
-            // barge-in: a fresh utterance heard while speaking kills the mouth (§5.1)
-            if bargeOn { bblock.lock(); let talking = ttsState == "speaking"; bblock.unlock()
-                if talking { barge() } }
+            // ⟦RECEIPT ACCOUNTING⟧: 'took' is the pure transcribe wall-time (orbit-stt.py);
+            // pair it with the audio length that produced it and the queue wait ahead of it.
+            // A 7.2s infer on a 30s ambient segment is arithmetic, not a mystery.
+            bblock.lock(); let ss = segSendTs.removeValue(forKey: seg); let wmWin = windowMouth; bblock.unlock()
+            let durS = ss?.1 ?? 0
+            let qms = ss.map { max(0, Int((CACurrentMediaTime() - $0.0) * 1000 - took * 1000)) } ?? -1
+            let acct = ss != nil ? ",\"dur\":\(String(format: "%.2f", durS)),\"queued_ms\":\(qms)" : ""
+            log("stt seg \(seg) result in \(String(format: "%.2f", took))s (audio \(String(format: "%.2f", durS))s, queued \(qms)ms): \(jsonStr(String(text.prefix(80))))")  // success leaves a receipt
+            publish("stt", "{\"id\":\(nextId()),\"seg\":\(seg),\"text\":\(jsonStr(text)),\"final\":true,\"engine\":\(jsonStr(eng)),\"took\":\(took)\(acct),\"ts\":\(Int(Date().timeIntervalSince1970*1000))}")
+            // barge-in: a fresh utterance heard while speaking kills the mouth (§5.1).
+            // WINDOW MOUTH exception: our own reply comes back through the room mic and
+            // the canceller has no reference for browser-side playback — never let our
+            // own voice barge ourselves; the plugin bargains via new-converse + barge POST.
+            if bargeOn { bblock.lock(); let talking = ttsState == "speaking" && !windowMouth; let selfEcho = wmWin && ttsState == "speaking"; bblock.unlock()
+                if talking { barge() }
+                else if selfEcho { log("barge suppressed: window mouth (own voice in the room)") } }
         }
     }
 
@@ -328,6 +341,12 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         guard dur > 0.35 else { return }        // ignore blips
         segId += 1
         let seg = segId
+        // ⟦RECEIPT ACCOUNTING⟧ (the 'STT 7.2s' mystery): a transcribe time is only
+        // plausible next to the audio length that produced it and the queue it waited
+        // behind. Stamp send-time + duration here; the result receipt spends them.
+        bblock.lock(); segSendTs[seg] = (CACurrentMediaTime(), dur)
+        if segSendTs.count > 200 { for k in segSendTs.keys where k < seg - 200 { segSendTs.removeValue(forKey: k) } }
+        bblock.unlock()
         feedEngine(seg, pcm16: samples)
         log("vad seg #\(seg) \(String(format: "%.2f", dur))s -> stt")
     }
@@ -386,6 +405,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         if path == "/b/status" { httpResp(conn, "200 OK", "application/json", statusJSON()); return true }
         if method == "POST" && path == "/b/tts" { beginTTS(conn, req); return true }
         if method == "POST" && path == "/b/tts/speak" { oneShot(conn, req); return true }
+        if method == "POST" && path == "/b/speak_state" { speakState(conn, req); return true }
         if method == "POST" && path == "/b/mode" { mode(conn, req); return true }
         if method == "POST" && path == "/b/inject" { inject(conn, req); return true }
         return false
@@ -895,6 +915,72 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         log("oneShot: \"\(String(text.prefix(40)))\" base=\(pBase.isEmpty ? "UNSET" : "set") model=\(pModel.isEmpty ? "unset" : pModel)")
         enqueue(text)
     }
+
+    // ⟦WINDOW MOUTH — THE VOICE LIVES WHERE THE EARS ARE⟧ (card t_ba7ca933):
+    // the desktop window synthesizes and plays conversation turns on the user's side of
+    // the wire; the sidecar keeps ear, duck, lamp truth and stats by RECEIPT, never by
+    // its own speakers. The window reports attempt phases; a 'speaking' report that
+    // outlives its generous deadline is an orphaned lamp (window died) and the pump
+    // extinguishes it exactly like the room mouth's zombie law.
+    func speakState(_ conn: NWConnection, _ req: String) {
+        var state = ""; var textLen = 0; var synthMs = -1; var finalRpt = false
+        if let sep = req.range(of: "\r\n\r\n"),
+           let j = try? JSONSerialization.jsonObject(with: Data(req[sep.upperBound...].utf8)) as? [String: Any] {
+            state = (j["state"] as? String) ?? ""
+            textLen = (j["text_len"] as? Int) ?? 0
+            synthMs = (j["synth_ms"] as? Int) ?? -1
+            finalRpt = (j["final"] as? Bool) ?? false
+        }
+        switch state {
+        case "start":
+            bblock.lock()
+            let cont = windowMouth && ttsState == "speaking"
+            if cont {
+                // next sentence of the SAME window turn — refresh the speech budget,
+                // a long multi-sentence answer must never be orphaned mid-reply
+                uttDeadline = CACurrentMediaTime() + Double(max(12, textLen)) * 0.19 + 8.0
+                spoken += 1
+                bblock.unlock()
+                log("window-mouth: sentence continues (len=\(textLen))")
+            } else {
+                turnN += 1; turnStart = CACurrentMediaTime(); firstAudioDone = false; firstLatencyMs = -1
+                turnMode = "browser"; turnSpokenBase = spoken; lastSynthMs = 0
+                ttsState = "speaking"; windowMouth = true; lastMode = "browser"; uttStart = turnStart
+                uttDeadline = CACurrentMediaTime() + Double(max(12, textLen)) * 0.19 + 8.0   // mirrors our own speech budget + synth slack
+                spoken += 1
+                let tN = turnN
+                bblock.unlock()
+                duckOrPause()
+                timing("start", tN, [])
+                outFlip(true, "browser")
+                log("window-mouth: speaking (turn \(tN), len=\(textLen))")
+            }
+        case "synth":
+            setState { if synthMs >= 0 { lastSynthMs = Double(synthMs) } }
+            firstAudio("browser")
+            log("window-mouth: first audio ready synth=\(synthMs)ms")
+        case "end":
+            bblock.lock()
+            let was = windowMouth || (ttsState == "speaking" && lastMode == "browser")
+            if was { windowMouth = false; ttsState = "idle"; uttDeadline = 0 }
+            let tN = turnN; let tStart = turnStart; let fl = firstLatencyMs; let n = spoken; let tBase = turnSpokenBase
+            if finalRpt { turnStart = 0 }
+            bblock.unlock()
+            if was {
+                unduckOrResume()
+                outFlip(false, "browser")
+                log("window-mouth: idle\(finalRpt ? " (turn closed)" : "")")
+                if finalRpt, tStart > 0 {
+                    timing("end", tN, ["\"total_ms\":\(Int((CACurrentMediaTime() - tStart) * 1000))",
+                                       "\"sentences\":\(max(0, n - tBase))", "\"mode\":\"browser\"",
+                                       "\"first_audio_ms\":\(Int(fl))"])
+                }
+            }
+        default:
+            log("speak_state: unknown state=\"\(state)\"")
+        }
+        httpResp(conn, "200 OK", "application/json", statusJSON())
+    }
     func mode(_ conn: NWConnection, _ req: String) {
         var stt: Bool? = nil
         if let sep = req.range(of: "\r\n\r\n"),
@@ -1002,6 +1088,8 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
               let raw = Data(base64Encoded: b64) else { log("inject: bad payload"); return }
         let (pcm, rate) = pcm16(fromWAV: raw)
         guard !pcm.isEmpty else { log("inject: no PCM"); return }
+        // receipt accounting applies to injected segments too (test drives the same spine)
+        ChannelB.shared.bblock.lock(); ChannelB.shared.segSendTs[seg] = (CACurrentMediaTime(), Double(pcm.count) / Double(max(1, rate))); ChannelB.shared.bblock.unlock()
         var wav = Data(wavHeaderStatic(Int32(pcm.count * 2), Int32(rate)))
         pcm.withUnsafeBytes { wav.append(contentsOf: $0) }
         if ProcessInfo.processInfo.environment["ORBIT_DEBUG_DUMP"] != nil { try? wav.write(to: URL(fileURLWithPath: "/tmp/orbit-inject-\(seg).wav")) }
@@ -1067,8 +1155,8 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // heartbeat @2s + queue drain watchdog
         if pumpTick % 10 == 0 {
             publish("b-status", statusJSON())
-            bblock.lock(); let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false) || (afProc?.isRunning ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; bblock.unlock()
-            if !talking && q && st != "idle" && inflight == 0 { bblock.lock(); ttsState = "idle"; bblock.unlock(); unduckOrResume(); if eof { ackTTS() } }
+            bblock.lock(); let talking = speech.isSpeaking || playerNode.isPlaying || (legacy?.isPlaying ?? false) || (afProc?.isRunning ?? false); let q = queued.isEmpty; let st = ttsState; let eof = ttsEOF; let open = streamOpen; let stale = CACurrentMediaTime() - lastByte > 30; let pastDeadline = CACurrentMediaTime() > uttDeadline; let inflight = synthInFlight; let wm = windowMouth; bblock.unlock()
+            if !talking && q && st != "idle" && inflight == 0 && !wm { bblock.lock(); ttsState = "idle"; bblock.unlock(); unduckOrResume(); if eof { ackTTS() } }
             // ⟦THE LAMP SHALL NOT OUTLIVE ITS MOUTH⟧ (2026-10-31, 01:15, Bob: "the speaker
             // lamp is stuck lit"): a fallback was SCHEDULED, the audio world died before it
             // spoke — isSpeaking false, node silent, legacy nil — and every idle rule was
@@ -1078,7 +1166,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
             if !talking && st == "speaking" && pastDeadline && inflight == 0 {
                 log("speaking lamp orphaned — no mouth moved; extinguished, queue drains")
                 speech.stopSpeaking(at: .immediate); playerNode.stop()
-                bblock.lock(); ttsState = "idle"; uttDeadline = 0; nodeEnds = 0; bblock.unlock()
+                bblock.lock(); ttsState = "idle"; uttDeadline = 0; nodeEnds = 0; windowMouth = false; bblock.unlock()
                 unduckOrResume(); outFlip(false, "")
                 DispatchQueue.main.async { self.speakNext() }
             }
@@ -1127,7 +1215,7 @@ final class ChannelB: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelega
         // generated from the VERSION file; build = git describe, else bYYYYMMDD.HHMM).
         // The plugin (card E) reads `version` for sidecar-installed detection -> tooltip "(vX)".
         return "{\"version\":\"\(SIDECAR_VERSION)\",\"build\":\"\(SIDECAR_BUILD)\",\"stt\":{\"state\":\"\(sttState)\",\"engine\":\"\(engineName)\",\"segs\":\(segsDone)},"
-             + "\"tts\":{\"state\":\"\(ttsState)\",\"queued\":\(queued.count),\"spoken\":\(spoken),\"mode\":\(jsonStr(lastMode)),"
+             + "\"tts\":{\"state\":\"\(ttsState)\",\"queued\":\(queued.count),\"spoken\":\(spoken),\"mode\":\(jsonStr(lastMode)),\"window\":\(windowMouth ? "true" : "false"),"
              + "\"provider\":{\"configured\":\(!pBase.isEmpty && !pModel.isEmpty),\"base\":\(jsonStr(pBase)),\"model\":\(jsonStr(pModel)),\"voice\":\(jsonStr(voiceOverride)),\"errs\":\(providerErrs)}},"
              + "\"boot\":\(ChannelB.bootMark),\"mic\":\"\(micOn ? "armed" : "muted")\",\"echoCancel\":\"\(canc.active ? "nlms-live" : "idle")\"}"
     }
