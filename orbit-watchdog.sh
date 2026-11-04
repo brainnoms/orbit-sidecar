@@ -22,7 +22,16 @@ kick() {
 }
 
 body="$(curl -s --max-time 6 http://127.0.0.1:8107/stream 2>/dev/null)"
-if [ -z "$body" ]; then kick "no-stream"; exit 0; fi
+if [ -z "$body" ]; then
+  # ⟦A BLIP IS NOT A HANG⟧ (card t_ba7ca933, 2026-11-04): one empty 6 s snapshot
+  # killed healthy sidecars (21:54, 23:18, 23:48, and 01:51 mid-test — the stream
+  # loop stutters while the VAD burst is hot; all 20 manual re-probes returned
+  # 20 KB+). Require TWO consecutive empty windows before condemning; a real wedge
+  # fails both, a scheduler hiccup gets 15 seconds to prove innocence.
+  sleep 2
+  body="$(curl -s --max-time 6 http://127.0.0.1:8107/stream 2>/dev/null)"
+  if [ -z "$body" ]; then kick "no-stream(x2)"; exit 0; fi
+fi
 
 frames="$(printf '%s' "$body" | grep -c '"s":')"
 empties="$(printf '%s' "$body" | grep -c '"s":\[\]')"
