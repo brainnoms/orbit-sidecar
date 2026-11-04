@@ -47,11 +47,32 @@ rm -f "$EMPTYMARK"   # frames flowing again -> streak reset
 # evidence of a dead aggregate. Everything else: no opinion, no kick.
 np="$(curl -s --max-time 3 http://127.0.0.1:8107/nowplaying 2>/dev/null)"
 npapp="$(printf '%s' "$np" | sed -n 's/.*"app":"\([^"]*\)".*/\1/p' | head -1)"
+# ⟦PAUSE IS NOT DEAFNESS — AND A FROZEN CLOCK IS NOT A CONCERT⟧ (card t_ba7ca933):
+# two independent lies made this rule a kick machine (4,750 lifetime kicks, ~every
+# 43 s for hours — each one re-muted the ear mid-side and the wake loop died in the
+# cradle):  (1) the STATE string lies — MR-STALE keeps reporting "playing" over a
+# frozen position, and a paused track still owns now-playing. A paused/frozen world
+# is honest silence; only POSITIONS THAT ADVANCE between two reads prove a concert.
+# (2) the SILENCE test judged the LAST frame — a quiet intro or an inter-beat gap
+# is rms 0 for one frame on a perfectly healthy tap. A dead aggregate is silent
+# ACROSS THE WHOLE WINDOW: every source line rms 0, not just the newest.
+# Both must hold, or this rule has no opinion and no kick.
+npstate="$(printf '%s' "$np" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p' | head -1)"
 case "$npapp" in
   Music|Spotify)
-    line="$(printf '%s' "$body" | grep "\"name\":\"$npapp:" | tail -1)"
-    if [ -n "$line" ] && printf '%s' "$line" | grep -qE '"rms":(0|0\.0+)[,}]'; then
-      kick "playing-but-silent($npapp tap deaf?)"
+    if [ "$npstate" = playing ]; then
+      sleep 2
+      np2="$(curl -s --max-time 3 http://127.0.0.1:8107/nowplaying 2>/dev/null)"
+      pos1="$(printf '%s' "$np"  | sed -n 's/.*"pos":\([0-9.]*\).*/\1/p' | head -1)"
+      pos2="$(printf '%s' "$np2" | sed -n 's/.*"pos":\([0-9.]*\).*/\1/p' | head -1)"
+      moving="$(awk -v a="${pos1:--1}" -v b="${pos2:--1}" 'BEGIN{print (b>a+0.2) ? 1 : 0}')"
+      if [ "$moving" = 1 ]; then
+        total="$(printf '%s' "$body" | grep -c "\"name\":\"$npapp:")"
+        noisy="$(printf '%s' "$body" | grep "\"name\":\"$npapp:" | grep -vEc '"rms":(0|0\.0+)[,}]')"
+        if [ "${total:-0}" -gt 0 ] && [ "${noisy:-0}" -eq 0 ]; then
+          kick "playing-and-fresh-but-whole-window-silent($npapp tap deaf?)"
+        fi
+      fi
     fi
     ;;
 esac
