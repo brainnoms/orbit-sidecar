@@ -69,8 +69,17 @@ case "$npapp" in
       if [ "$moving" = 1 ]; then
         total="$(printf '%s' "$body" | grep -c "\"name\":\"$npapp:")"
         noisy="$(printf '%s' "$body" | grep "\"name\":\"$npapp:" | grep -vEc '"rms":(0|0\.0+)[,}]')"
-        if [ "${total:-0}" -gt 0 ] && [ "${noisy:-0}" -eq 0 ]; then
-          kick "playing-and-fresh-but-whole-window-silent($npapp tap deaf?)"
+        SILENTMARK="/tmp/orbit_watchdog_silentkicked"
+        if [ "${total:-0}" -gt 0 ] && [ "${noisy:-0}" -gt 0 ]; then
+          rm -f "$SILENTMARK"   # an audible frame in this window: tap alive, streak reset
+        fi
+        # ⟦A KICK THAT CURES NOTHING SHALL NOT KICK AGAIN⟧: a genuinely quiet track
+        # (soft intro, meter floor) reads rms-0 across the WHOLE window forever; the
+        # restart cannot cure it, only churn the ear. One kick per silence-streak,
+        # exactly like the s:[] rule — the mark dies on the first audible frame.
+        if [ "${total:-0}" -gt 0 ] && [ "${noisy:-0}" -eq 0 ] && [ ! -f "$SILENTMARK" ]; then
+          touch "$SILENTMARK"
+          kick "playing-and-fresh-but-whole-window-silent($npapp tap deaf? first-strike)"
         fi
       fi
     fi
