@@ -1169,6 +1169,7 @@ func handle(_ conn: NWConnection, _ req: String) {
         return
     }
     if path == "/sources" { httpResp(conn, "200 OK", "application/json", "{\"sources\":" + sourcesArr() + "}"); return }
+    if path == "/sky" { httpResp(conn, "200 OK", "application/json", skySnapshot()); return } // Sky P3: derived-facts record snapshot (t_c79ef288)
     if path == "/volume" { httpResp(conn, "200 OK", "application/json", "{\"vol\":\(curVol()),\"ducked\":\(ducked)}"); return }
     if path == "/npdbg" {
         let d = npDiag(); let body = (try? JSONSerialization.data(withJSONObject: d)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
