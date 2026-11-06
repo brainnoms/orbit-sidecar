@@ -474,6 +474,21 @@ every(1.0) { duckQ.async { let v = readVol(outDev, 0); if v >= 0 { cachedVol = v
 let PORT = NWEndpoint.Port(rawValue: UInt16(ProcessInfo.processInfo.environment["ORBIT_PORT"] ?? "8107") ?? 8107)!
 var sseConns: [NWConnection] = []
 let sseLock = NSLock()
+// SSE pump state DECLARED EARLY, next to sseConns (same law as EPOCH above:
+// Swift top-level vars init in source order — the /stream handler references
+// these and may run before the pump section executes). Bookkeeping is owned
+// by ssePumpQ; see the pump section for the cadence law. (t_28b3403e)
+let SSE_HOT = 1.0 / 13.0
+let SSE_IDLE = 1.0
+let SSE_DEMOTE = 3.0
+let ssePumpQ = DispatchQueue(label: "orbit.sse.pump", qos: .userInitiated)   // .utility parked its worker between ticks and lost ~20% of them to energy-efficiency slop; .userInitiated keeps the meter honest (t_28b3403e)
+var ssePumpTimer: DispatchSourceTimer?
+var sseHot = false
+var sseEmptySince: CFTimeInterval = 0   // stamp of first empty-roster tick; 0 = roster non-empty
+var sseHotTicks = 0                     // self-report: ticks between promote and demote
+var sseHotStart: CFTimeInterval = 0
+var sseLastTick: CFTimeInterval = 0     // stamp of the last hot tick — honest self-report denominator
+var sseNapToken: NSObjectProtocol?      // .latencyCritical activity held ONLY while hot — background timer throttling ate ~25% of ticks when napped (t_28b3403e)
 func send(_ c: NWConnection, _ s: String) { c.send(content: s.data(using: .utf8), completion: .contentProcessed { _ in }) }
 func httpResp(_ c: NWConnection, _ status: String, _ ctype: String, _ body: String) {
     let r = "HTTP/1.1 \(status)\r\nContent-Type: \(ctype)\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n" + body
@@ -1155,7 +1170,7 @@ func handle(_ conn: NWConnection, _ req: String) {
     if path == "/stream" || path.hasPrefix("/stream?") {
         send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n")
         sseLock.lock(); sseConns.append(conn); sseLock.unlock()
-        DispatchQueue.main.async { ssePromote() }   // subscriber-gate: wake the pump to meter cadence NOW (t_28b3403e)
+        ssePumpQ.async { ssePromote() }   // subscriber-gate: promote on the pump's OWN serial queue (t_28b3403e) — never the concurrent global queue: two simultaneous /stream opens must not race on the cadence bookkeeping
         if path.hasPrefix("/stream?") {          // control plane: proto=1 opts in; proto-less query params change NOTHING
             let q = String(path.dropFirst("/stream?".count))
             func qp(_ k: String) -> String? {
@@ -1318,6 +1333,7 @@ server.newConnectionHandler = { conn in
         if let d = data, let s = String(data: d, encoding: .utf8) { handle(conn, s) }
     }
 }
+ssePumpQ.async { sseSetCadence(hot: false) }   // boot the pump BEFORE any request can arrive (t_28b3403e)
 var booted = false   // one-shot: announce sidecar-boot once the plane is up
 server.stateUpdateHandler = { st in
     if case .ready = st {
@@ -1334,51 +1350,53 @@ func every(_ t: TimeInterval, _ body: @escaping () -> Void) {
     RunLoop.main.add(timer, forMode: .common)
 }
 // ---- SSE meter pump — SUBSCRIBER-GATED (t_28b3403e) ----------------------
-// ⟦CADENCE IS THE DISEASE, NOT COMPUTE⟧: this used to run every(0.05) forever —
-// 20 RunLoop wakeups/s with ZERO listeners (baseline t_f467f292 lineage: 30.5
-// wakes/s at 0.1% CPU). Now the roster drives the cadence:
+// ⟦CADENCE IS THE DISEASE, NOT COMPUTE⟧: this used to run every(0.05) on
+// RunLoop.main forever — waking the plane with ZERO listeners (baseline
+// lineage: 30.5 wakes/s at 0.1% CPU). Worse, main is not a metronome: np/scan
+// work eats ticks (the old 20 Hz timer measurably delivered ~8-9 Hz). The gate
+// moves the pump to its own DispatchSource queue where the cadence is real:
 //   listener present → meter at 13 Hz (relaxed from 20; inside the 12–15 band;
 //                      snapshot+reset => fresh per-window peak/rms)
 //   nobody listening → 1 Hz idle heartbeat — no JSON built, nothing sent
-// Promotion is instant: the /stream handler hops ssePromote() to main the moment
-// it appends a connection. Demotion waits SSE_DEMOTE seconds of EMPTY roster so
-// a plugin reconnect or the watchdog's 6 s probe never flaps cadence. The
-// watchdog promotes the pump BY CONNECTING (its curl lands as a subscriber), so
-// its "no frames → kick" rule stays safe — frames answer the probe itself.
-// All pump bookkeeping is main-thread only; HTTP handlers hop in via ssePromote().
-let SSE_HOT = 1.0 / 13.0
-let SSE_IDLE = 1.0
-let SSE_DEMOTE = 3.0
-var ssePumpTimer: Timer?
-var sseHot = false
-var sseEmptySince: CFTimeInterval = 0   // stamp of first empty-roster tick; 0 = roster non-empty
-var sseHotTicks = 0                     // self-report: ticks between promote and demote
-var sseHotStart: CFTimeInterval = 0
-
-func sseSetCadence(hot: Bool) {
+// Promotion is instant: the /stream handler hops ssePromote() onto the pump
+// queue the moment it appends a connection. Demotion waits SSE_DEMOTE seconds
+// of EMPTY roster so a plugin reconnect or the watchdog's 6 s probe never
+// flaps cadence. The watchdog promotes the pump BY CONNECTING (its curl lands
+// as a subscriber), so its "no frames → kick" rule stays safe — frames answer
+// the probe itself. All pump bookkeeping is pump-queue-owned; frameJSON is
+// lock-guarded and main-free, NWConnection.send is thread-safe.
+// (State + cadence constants are declared EARLY, beside sseConns.)
+func sseSetCadence(hot: Bool) {         // pump-queue only
     if sseHot && !hot {
-        let span = max(0.001, CACurrentMediaTime() - sseHotStart)
-        log(String(format: "sse pump → idle heartbeat (hot %.0f ticks at %.1f Hz over %.1fs)", Double(sseHotTicks), Double(sseHotTicks) / span, span))
+        let span = max(0.001, sseLastTick - sseHotStart)
+        log(String(format: "sse pump → idle heartbeat (hot %d ticks at %.1f Hz over %.1fs)", sseHotTicks, Double(sseHotTicks) / span, span))
+        if let tok = sseNapToken { ProcessInfo.processInfo.endActivity(tok); sseNapToken = nil }
     } else if !sseHot && hot {
         log("sse pump → hot meter @13Hz")
         sseHotTicks = 0; sseHotStart = CACurrentMediaTime()
+        if sseNapToken == nil {
+            sseNapToken = ProcessInfo.processInfo.beginActivity(options: .latencyCritical, reason: "SSE meter @13Hz — subscriber-gated")
+        }
     }
-    ssePumpTimer?.invalidate()
+    ssePumpTimer?.cancel()
     sseHot = hot
-    let t = Timer(timeInterval: hot ? SSE_HOT : SSE_IDLE, repeats: true) { _ in sseTick() }
-    RunLoop.main.add(t, forMode: .common)
+    let t = DispatchSource.makeTimerSource(queue: ssePumpQ)
+    t.schedule(deadline: .now() + (hot ? SSE_HOT : SSE_IDLE), repeating: hot ? SSE_HOT : SSE_IDLE)   // RELATIVE deadline: each fire reschedules from completion, so send-backlog time never eats ticks; no leeway = no coalescing (t_28b3403e)
+    t.setEventHandler { sseTick() }
+    t.resume()
     ssePumpTimer = t
 }
-func ssePromote() {                     // main queue: first listener wakes the pump
+func ssePromote() {                     // pump queue: first listener wakes the pump
     if !sseHot { sseSetCadence(hot: true) }
 }
-func sseTick() {
+func sseTick() {                        // pump queue
     sseLock.lock(); let conns = sseConns; sseConns = []; sseLock.unlock()
     var alive: [NWConnection] = []
     if !conns.isEmpty {
         sseEmptySince = 0
         if !sseHot { sseSetCadence(hot: true) }   // safety net: promote even if the append hop was missed
         sseHotTicks += 1
+        sseLastTick = CACurrentMediaTime()
         let frame = frameJSON(reset: true)
         for c in conns { if c.state == .ready { send(c, "event: levels\ndata: " + frame + "\n\n"); alive.append(c) } }
     } else if sseHot {
@@ -1388,7 +1406,6 @@ func sseTick() {
     }
     sseLock.lock(); sseConns = alive; sseLock.unlock()
 }
-sseSetCadence(hot: false)   // boot idle: heartbeat cadence until the first /stream promotes
 // human reporter @0.5s for our eyes
 every(0.5) { print(frameJSON(reset: true)) }
 // rescan every 4s — sources appear/vanish live
