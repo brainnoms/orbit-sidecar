@@ -1155,6 +1155,7 @@ func handle(_ conn: NWConnection, _ req: String) {
     if path == "/stream" || path.hasPrefix("/stream?") {
         send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n")
         sseLock.lock(); sseConns.append(conn); sseLock.unlock()
+        DispatchQueue.main.async { ssePromote() }   // subscriber-gate: wake the pump to meter cadence NOW (t_28b3403e)
         if path.hasPrefix("/stream?") {          // control plane: proto=1 opts in; proto-less query params change NOTHING
             let q = String(path.dropFirst("/stream?".count))
             func qp(_ k: String) -> String? {
@@ -1332,14 +1333,62 @@ func every(_ t: TimeInterval, _ body: @escaping () -> Void) {
     let timer = Timer(timeInterval: t, repeats: true) { _ in body() }
     RunLoop.main.add(timer, forMode: .common)
 }
-// SSE @ ~20Hz (snapshot+reset => fresh per-window peak/rms)
-every(0.05) {
-    let frame = frameJSON(reset: true)
+// ---- SSE meter pump — SUBSCRIBER-GATED (t_28b3403e) ----------------------
+// ⟦CADENCE IS THE DISEASE, NOT COMPUTE⟧: this used to run every(0.05) forever —
+// 20 RunLoop wakeups/s with ZERO listeners (baseline t_f467f292 lineage: 30.5
+// wakes/s at 0.1% CPU). Now the roster drives the cadence:
+//   listener present → meter at 13 Hz (relaxed from 20; inside the 12–15 band;
+//                      snapshot+reset => fresh per-window peak/rms)
+//   nobody listening → 1 Hz idle heartbeat — no JSON built, nothing sent
+// Promotion is instant: the /stream handler hops ssePromote() to main the moment
+// it appends a connection. Demotion waits SSE_DEMOTE seconds of EMPTY roster so
+// a plugin reconnect or the watchdog's 6 s probe never flaps cadence. The
+// watchdog promotes the pump BY CONNECTING (its curl lands as a subscriber), so
+// its "no frames → kick" rule stays safe — frames answer the probe itself.
+// All pump bookkeeping is main-thread only; HTTP handlers hop in via ssePromote().
+let SSE_HOT = 1.0 / 13.0
+let SSE_IDLE = 1.0
+let SSE_DEMOTE = 3.0
+var ssePumpTimer: Timer?
+var sseHot = false
+var sseEmptySince: CFTimeInterval = 0   // stamp of first empty-roster tick; 0 = roster non-empty
+var sseHotTicks = 0                     // self-report: ticks between promote and demote
+var sseHotStart: CFTimeInterval = 0
+
+func sseSetCadence(hot: Bool) {
+    if sseHot && !hot {
+        let span = max(0.001, CACurrentMediaTime() - sseHotStart)
+        log(String(format: "sse pump → idle heartbeat (hot %.0f ticks at %.1f Hz over %.1fs)", Double(sseHotTicks), Double(sseHotTicks) / span, span))
+    } else if !sseHot && hot {
+        log("sse pump → hot meter @13Hz")
+        sseHotTicks = 0; sseHotStart = CACurrentMediaTime()
+    }
+    ssePumpTimer?.invalidate()
+    sseHot = hot
+    let t = Timer(timeInterval: hot ? SSE_HOT : SSE_IDLE, repeats: true) { _ in sseTick() }
+    RunLoop.main.add(t, forMode: .common)
+    ssePumpTimer = t
+}
+func ssePromote() {                     // main queue: first listener wakes the pump
+    if !sseHot { sseSetCadence(hot: true) }
+}
+func sseTick() {
     sseLock.lock(); let conns = sseConns; sseConns = []; sseLock.unlock()
     var alive: [NWConnection] = []
-    for c in conns { if c.state == .ready { send(c, "event: levels\ndata: " + frame + "\n\n"); alive.append(c) } }
+    if !conns.isEmpty {
+        sseEmptySince = 0
+        if !sseHot { sseSetCadence(hot: true) }   // safety net: promote even if the append hop was missed
+        sseHotTicks += 1
+        let frame = frameJSON(reset: true)
+        for c in conns { if c.state == .ready { send(c, "event: levels\ndata: " + frame + "\n\n"); alive.append(c) } }
+    } else if sseHot {
+        // hot roster went empty: countdown, then downshift to heartbeat
+        if sseEmptySince == 0 { sseEmptySince = CACurrentMediaTime() }
+        else if CACurrentMediaTime() - sseEmptySince > SSE_DEMOTE { sseSetCadence(hot: false) }
+    }
     sseLock.lock(); sseConns = alive; sseLock.unlock()
 }
+sseSetCadence(hot: false)   // boot idle: heartbeat cadence until the first /stream promotes
 // human reporter @0.5s for our eyes
 every(0.5) { print(frameJSON(reset: true)) }
 // rescan every 4s — sources appear/vanish live
