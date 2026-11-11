@@ -1,5 +1,7 @@
 # orbit-sidecar
 
+![Orbit sky](https://raw.githubusercontent.com/brainnoms/orbit-visualizer/v0.9.0/docs/media/banner.png)
+
 A local macOS audio sidecar for the [Orbit](https://github.com/brainnoms/orbit-visualizer)
 visualizer plugin family for Hermes Desktop. It runs on your machine, binds to
 `127.0.0.1:8107`, and serves two things over plain HTTP/SSE:
